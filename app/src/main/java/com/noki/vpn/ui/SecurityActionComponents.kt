@@ -84,7 +84,7 @@ internal fun SecurityAndroidVersionBlock(
             modifier = Modifier
                 .fillMaxWidth()
                 .heightIn(min = metrics.dp(48f))
-                .padding(horizontal = metrics.dp(8f)),
+                .padding(horizontal = if (required) 0.dp else metrics.dp(8f)),
             horizontalArrangement = Arrangement.SpaceBetween,
             verticalAlignment = Alignment.CenterVertically,
         ) {
@@ -123,18 +123,30 @@ internal fun SecurityAndroidVersionBlock(
             }
         }
         if (update != null || required) {
-            SecurityGlassActionButton(
-                text = if (required) {
-                    tr(language, "Обновить", "Update")
-                } else if (updateState.isReadyToInstall) {
+            val actionText = when {
+                updateState.isReadyToInstall ->
                     tr(language, "Установить обновление", "Install update")
-                } else if (updateState.isDownloading) {
+                required -> tr(language, "Обновить", "Update")
+                updateState.isDownloading ->
                     tr(language, "Скачивание", "Downloading")
-                } else {
-                    tr(language, "Обновить приложение", "Update app")
+                else -> tr(language, "Обновить приложение", "Update app")
+            }
+            if (required) AuthPrimaryButton(
+                text = actionText,
+                loading = isBusy,
+                modifier = Modifier.fillMaxWidth().height(metrics.dp(52f)).semantics {
+                    role = Role.Button
+                    if (isBusy) contentDescription = if (updateState.isDownloading)
+                        tr(language, "Скачивание обновления", "Downloading update")
+                    else tr(language, "Проверка обновлений", "Checking for updates")
                 },
+                cornerRadius = metrics.dp(16f),
+                useCommonButtonTextStyle = false,
+                onClick = onClick,
+            ) else SecurityGlassActionButton(
+                text = actionText,
                 enabled = !isBusy,
-                showProgress = updateState.isDownloading || (required && updateState.isChecking),
+                showProgress = updateState.isDownloading,
                 backdrop = backdrop,
                 liveGlassEnabled = liveGlassEnabled,
                 accentGradientFill = true,

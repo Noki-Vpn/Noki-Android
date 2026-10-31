@@ -109,16 +109,18 @@ class AdaptiveScreenLayoutTest {
     }
 
     @Test
+    @Config(qualifiers = "w412dp-h915dp-420dpi")
     fun mandatoryUpdateHasOneActionIgnoresDismissalAndReusesDownloadProgress() {
         var updates = 0
         var updateState by androidx.compose.runtime.mutableStateOf(com.noki.vpn.AndroidUpdateUiState(
             isRequired = true,
-            currentVersionName = "1.9.6",
-            update = com.noki.vpn.AndroidUpdateInfo(287, "1.9.7", architecture = "arm64-v8a", apkUrl = "https://example.invalid/update.apk"),
+            currentVersionName = "2.2.1",
+            update = com.noki.vpn.AndroidUpdateInfo(315, "2.2.2", architecture = "arm64-v8a", apkUrl = "https://example.invalid/update.apk"),
         ))
         render { MandatoryAndroidUpdateDialog(updateState, AppLanguage.RU) { updates++ } }.use {
             compose.onNodeWithText("Необходимо обновить приложение").assertIsDisplayed()
             compose.onAllNodes(hasClickAction()).assertCountEquals(1)
+            saveImage("mandatory-update", includeDialogs = true)
             compose.runOnIdle {
                 val dialog = org.robolectric.shadows.ShadowDialog.getLatestDialog()
                 dialog.dispatchKeyEvent(android.view.KeyEvent(android.view.KeyEvent.ACTION_DOWN, android.view.KeyEvent.KEYCODE_BACK))
@@ -129,13 +131,19 @@ class AdaptiveScreenLayoutTest {
                 assertTrue(dialog.isShowing)
             }
             compose.onNodeWithText("Обновить").performClick()
+            compose.waitForIdle()
             assertEquals(1, updates)
             compose.runOnIdle { updateState = updateState.copy(isDownloading = true) }
-            compose.onNodeWithText("Обновить").assertIsNotEnabled()
+            compose.onNodeWithContentDescription("Скачивание обновления").assertIsNotEnabled()
             compose.onAllNodes(androidx.compose.ui.test.hasProgressBarRangeInfo(
                 androidx.compose.ui.semantics.ProgressBarRangeInfo.Indeterminate,
             )).assertCountEquals(1)
             assertEquals(1, updates)
+            saveImage("mandatory-update-downloading", includeDialogs = true)
+            compose.runOnIdle { updateState = updateState.copy(isDownloading = false, isReadyToInstall = true) }
+            compose.onNodeWithText("Установить обновление").assertIsDisplayed().performClick()
+            compose.waitForIdle()
+            assertEquals(2, updates)
         }
     }
 
