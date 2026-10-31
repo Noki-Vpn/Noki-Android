@@ -5,6 +5,8 @@ internal interface VpnCoreRuntime {
 
     fun rebindNetwork(): Boolean
 
+    fun wake()
+
     fun stop()
 
     fun cancelMeasureDelay()

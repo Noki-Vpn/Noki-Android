@@ -189,6 +189,8 @@ internal class VpnConnectionOrchestrator(
 
     fun rebindNetwork(): Boolean = core.rebindNetwork()
 
+    fun wake() = core.wake()
+
     fun cancelReadinessProbe() {
         core.cancelMeasureDelay()
     }

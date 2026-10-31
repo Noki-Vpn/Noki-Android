@@ -2,6 +2,7 @@ package com.noki.vpn.vpn
 
 import android.content.Context
 import android.net.ConnectivityManager
+import android.net.LinkProperties
 import android.net.Network
 import android.net.NetworkCapabilities
 import android.net.NetworkRequest
@@ -63,6 +64,14 @@ internal class VpnNetworkMonitor(
         awaitOtherCallbacks()
         scheduler.cancel(debounceOwner)
         scheduler.cancel(validationRecheckOwner)
+    }
+
+    fun refresh() {
+        val epoch = lifecycleLock.withLock { startedEpoch }
+        if (epoch == 0L) return
+        scheduler.cancel(debounceOwner)
+        scheduler.cancel(validationRecheckOwner)
+        emitCurrentObservation(epoch)
     }
 
     private fun scheduleSnapshot(epoch: Long) {
@@ -177,6 +186,8 @@ internal class VpnNetworkMonitor(
                 override fun onAvailable(network: Network) = onChanged()
 
                 override fun onLost(network: Network) = onChanged()
+
+                override fun onLinkPropertiesChanged(network: Network, linkProperties: LinkProperties) = onChanged()
 
                 override fun onCapabilitiesChanged(
                     network: Network,

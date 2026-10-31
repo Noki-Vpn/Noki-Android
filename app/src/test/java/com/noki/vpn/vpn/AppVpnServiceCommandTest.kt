@@ -281,7 +281,7 @@ class AppVpnServiceCommandTest {
     }
 
     @Test
-    fun ruSocketRebindDoesNotConfirmUnderlayUntilRuntimeReadinessRecovers() = runBlocking {
+    fun ruSocketRebindDoesNotRepeatWhenHttpReadinessFails() = runBlocking {
         val fixture = Fixture(this)
         val session = ruSession()
         fixture.useRuSession(session) { 503 to "{}" }
@@ -295,8 +295,8 @@ class AppVpnServiceCommandTest {
             yield()
             assertEquals(1, fixture.runtimeRebinds)
             fixture.orchestrator.withLifecycleLock {}
-            org.junit.Assert.assertTrue(probes > 0)
-            assertNull(fixture.orchestrator.currentUnderlay())
+            assertEquals(0, probes)
+            org.junit.Assert.assertNotNull(fixture.orchestrator.currentUnderlay())
             assertEquals(tunnel, fixture.orchestrator.currentTunnel())
             assertEquals(generation, fixture.orchestrator.currentGenerationId())
             assertEquals(session, fixture.ruSession())
@@ -307,7 +307,7 @@ class AppVpnServiceCommandTest {
             fixture.workingEndpoint = "ru"
             shadowOf(Looper.getMainLooper()).idleFor(java.time.Duration.ofSeconds(2))
             yield()
-            assertEquals(2, fixture.runtimeRebinds)
+            assertEquals(1, fixture.runtimeRebinds)
             fixture.orchestrator.withLifecycleLock {}
             org.junit.Assert.assertNotNull(fixture.orchestrator.currentUnderlay())
             assertEquals(tunnel, fixture.orchestrator.currentTunnel())
@@ -1119,6 +1119,98 @@ class AppVpnServiceCommandTest {
     }
 
     @Test
+    fun screenWakeChecksTheSameRuntimeOnceWithoutRestartingOrChangingSelection(): Unit = runBlocking {
+        val fixture = Fixture(this, probeFallback = true, workingEndpoint = "tcp1", realSidecars = true)
+        fixture.setNetworkAvailability(UnderlyingNetworkAvailability.Validated)
+        fixture.startPrepared(EndpointSelectionMode.MANUAL)
+        val before = fixture.orchestrator.snapshot()
+        val tunnel = fixture.orchestrator.currentTunnel()
+        val starts = fixture.startedEndpoints.toList()
+        val stops = fixture.runtimeStops
+        try {
+            fixture.invoke("handleScreenStateChanged", true)
+            fixture.invoke("handleScreenStateChanged", true)
+            fixture.awaitWakeProbe()
+            assertEquals(1, fixture.runtimeWakes)
+            assertEquals(0, fixture.runtimeRebinds)
+            assertEquals(starts, fixture.startedEndpoints)
+            assertEquals(stops, fixture.runtimeStops)
+            assertEquals(before.owner, fixture.orchestrator.snapshot().owner)
+            assertEquals(before.activeSettings, fixture.orchestrator.currentSettings())
+            assertEquals(tunnel, fixture.orchestrator.currentTunnel())
+            assertEquals(true, fixture.watchdogProbes.last())
+            assertEquals(VpnProbePlanPolicy.WATCHDOG_TOTAL_TIMEOUT_MILLIS, fixture.probeTimeouts.last())
+        } finally { fixture.stop(1); fixture.orchestrator.activeTransitionJob()?.join() }
+    }
+
+    @Test
+    fun failedWakeHttpProbesDoNotResetSocketsOrSelectAnotherServer(): Unit = runBlocking {
+        val fixture = Fixture(this, probeFallback = true, workingEndpoint = "tcp1", realSidecars = true)
+        fixture.setNetworkAvailability(UnderlyingNetworkAvailability.Validated)
+        fixture.startPrepared(EndpointSelectionMode.MANUAL)
+        val before = fixture.orchestrator.snapshot()
+        val starts = fixture.startedEndpoints.toList()
+        val stops = fixture.runtimeStops
+        fixture.workingEndpoint = null
+        try {
+            repeat(3) {
+                fixture.invoke("handleScreenStateChanged", false)
+                fixture.invoke("handleScreenStateChanged", true)
+                fixture.awaitWakeProbe()
+            }
+            shadowOf(Looper.getMainLooper()).idleFor(java.time.Duration.ofSeconds(10))
+            yield()
+            assertEquals(3, fixture.runtimeWakes)
+            assertEquals(0, fixture.runtimeRebinds)
+            assertEquals(starts, fixture.startedEndpoints)
+            assertEquals(stops, fixture.runtimeStops)
+            assertEquals(before.owner, fixture.orchestrator.snapshot().owner)
+            assertEquals(before.activeSettings, fixture.orchestrator.currentSettings())
+            assertEquals(VpnConnectionState.CONNECTED, fixture.orchestrator.currentState())
+        } finally { fixture.stop(1); fixture.orchestrator.activeTransitionJob()?.join() }
+    }
+
+    @Test
+    fun staleWakeProbeCannotApplyEvidenceAfterGenerationChanges(): Unit = runBlocking {
+        val fixture = Fixture(this, probeFallback = true, workingEndpoint = "tcp1", realSidecars = true)
+        fixture.setNetworkAvailability(UnderlyingNetworkAvailability.Validated)
+        fixture.startPrepared(EndpointSelectionMode.MANUAL)
+        fixture.onProbe = { fixture.orchestrator.invalidate() }
+        val watchdog = AppVpnService::class.java.getDeclaredField("watchdogController")
+            .apply { isAccessible = true }.get(fixture.service) as VpnWatchdogController
+        watchdog.resetNetworkEvidence()
+        try {
+            fixture.invoke("handleScreenStateChanged", true)
+            fixture.awaitWakeProbe()
+            assertFalse(watchdog.hasFreshVpnEvidence())
+            assertEquals(0, fixture.runtimeRebinds)
+        } finally { fixture.stop(1); fixture.orchestrator.activeTransitionJob()?.join() }
+    }
+
+    @Test
+    fun screenAndUnlockBroadcastsProduceOneWakeEvent() {
+        val context = org.robolectric.RuntimeEnvironment.getApplication()
+        val power = context.getSystemService(android.content.Context.POWER_SERVICE) as android.os.PowerManager
+        shadowOf(power).setIsInteractive(false)
+        val events = mutableListOf<Boolean>()
+        val monitor = VpnScreenStateMonitor(context, events::add)
+        monitor.start()
+        try {
+            context.sendBroadcast(android.content.Intent(android.content.Intent.ACTION_SCREEN_ON))
+            context.sendBroadcast(android.content.Intent(android.content.Intent.ACTION_USER_PRESENT))
+            shadowOf(Looper.getMainLooper()).idle()
+            assertEquals(listOf(true), events)
+            context.sendBroadcast(android.content.Intent(android.content.Intent.ACTION_SCREEN_OFF))
+            shadowOf(Looper.getMainLooper()).idle()
+            shadowOf(power).setIsInteractive(true)
+            context.sendBroadcast(android.content.Intent(android.os.PowerManager.ACTION_DEVICE_IDLE_MODE_CHANGED))
+            context.sendBroadcast(android.content.Intent(android.content.Intent.ACTION_USER_PRESENT))
+            shadowOf(Looper.getMainLooper()).idle()
+            assertEquals(listOf(true, false, true), events)
+        } finally { monitor.stop() }
+    }
+
+    @Test
     fun networkLostDuringWatchdogProbeBeforeCallbackCannotStartRecovery(): Unit = runBlocking {
         val fixture = Fixture(this, probeFallback = true, workingEndpoint = "tcp1")
         fixture.setNetworkAvailability(UnderlyingNetworkAvailability.Validated)
@@ -1902,6 +1994,7 @@ class AppVpnServiceCommandTest {
         var runtimeCarrier = ""
         var runtimeStops = 0
         var runtimeRebinds = 0
+        var runtimeWakes = 0
         var runtimeRebindSucceeds = true
         var tunnelsCreated = 0
         var onProbe: () -> Unit = {}
@@ -1943,6 +2036,7 @@ class AppVpnServiceCommandTest {
                     return true
                 }
                 override fun stop() { runtimeStops++; runtimeRunning = false }
+                override fun wake() { runtimeWakes++ }
                 override fun rebindNetwork(): Boolean {
                     runtimeRebinds++
                     return runtimeRebindSucceeds
@@ -2033,7 +2127,7 @@ class AppVpnServiceCommandTest {
             }
             set("settingsStore", store)
             set("networkMonitor", VpnNetworkMonitor(
-                source = { error("unexpected network callback") },
+                source = { AndroidUnderlyingNetworkSource(service).currentObservation() },
                 scheduler = scheduler,
                 debounceMillis = 1L,
                 register = { null },
@@ -2163,6 +2257,12 @@ class AppVpnServiceCommandTest {
         }
 
         fun savedSettings(): StoredSettings = store.load()
+
+        suspend fun awaitWakeProbe() {
+            val inFlight = AppVpnService::class.java.getDeclaredField("wakeProbeInFlight")
+                .apply { isAccessible = true }.get(service) as java.util.concurrent.atomic.AtomicBoolean
+            kotlinx.coroutines.withTimeout(5_000L) { while (inFlight.get()) yield() }
+        }
 
         fun saveSettings(settings: StoredSettings) {
             store.updateSettings { settings }

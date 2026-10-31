@@ -10,6 +10,27 @@ import java.util.concurrent.atomic.AtomicInteger
 
 class VpnNetworkMonitorTest {
     @Test
+    fun `wake refresh reads immediately and cancels the older debounce`() {
+        val scheduler = RecordingScheduler()
+        var callback: (() -> Unit)? = null
+        val emitted = mutableListOf<UnderlyingNetworkObservation<UnderlyingNetworkSnapshot>>()
+        val monitor = VpnNetworkMonitor(
+            source = { observation(UnderlyingNetworkAvailability.Validated, "awake") },
+            scheduler = scheduler, debounceMillis = 25L,
+            register = { callback = it; null },
+        )
+        monitor.start(emitted::add)
+        callback?.invoke()
+        monitor.refresh()
+        assertEquals(listOf("awake"), emitted.map { it.candidate?.signature })
+        scheduler.runPending()
+        assertEquals(1, emitted.size)
+        monitor.stop()
+        monitor.refresh()
+        assertEquals(1, emitted.size)
+    }
+
+    @Test
     fun `network events coalesce to one latest immutable snapshot and stop cancels ownership`() {
         val scheduler = RecordingScheduler()
         var registeredCallback: (() -> Unit)? = null

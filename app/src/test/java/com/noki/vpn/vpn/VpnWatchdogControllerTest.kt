@@ -8,6 +8,27 @@ import org.junit.Test
 
 class VpnWatchdogControllerTest {
     @Test
+    fun `wake invalidates old probes but does not discard or refresh healthy evidence`() {
+        var now = 0L
+        var cancelled = 0
+        val controller = VpnWatchdogController(
+            scheduler = WatchdogScheduler(), nowMillis = { now },
+            launchProbe = { _, _ -> CancelableTask { cancelled++ } },
+            isLockdown = { false }, evidenceFreshMillis = 10_000L,
+        )
+        val owner = watchdogOwner(1L)
+        controller.start(owner, DefaultStoredSettingsFactory.create(), initialVpnEvidence = true)
+        controller.forceProbe()
+        now = 5_000L
+        controller.resetNetworkEvidence(preserveHealthyEvidence = true)
+        assertEquals(1, cancelled)
+        assertEquals(WatchdogProbeOutcome.Ignored, controller.completeProbe(owner, null))
+        assertTrue(controller.hasFreshVpnEvidence())
+        now = 10_001L
+        assertFalse(controller.hasFreshVpnEvidence())
+    }
+
+    @Test
     fun `manual server never restarts or releases a failing tunnel`() {
         for (lockdown in listOf(false, true)) {
             val controller = VpnWatchdogController(

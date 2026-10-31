@@ -75,12 +75,14 @@ internal class VpnWatchdogController(
     }
 
     @Synchronized
-    fun resetNetworkEvidence() {
+    fun resetNetworkEvidence(preserveHealthyEvidence: Boolean = false) {
         activeProbe?.cancel()
         activeProbe = null
         failureCount = 0
-        lastHealthyMillis = null
-        lastVpnEvidenceMillis = null
+        if (!preserveHealthyEvidence) {
+            lastHealthyMillis = null
+            lastVpnEvidenceMillis = null
+        }
         val owner = activeOwner ?: return
         val updated = owner.copy(networkRevision = owner.networkRevision + 1)
         activeOwner = updated

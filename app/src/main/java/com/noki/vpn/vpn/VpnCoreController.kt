@@ -110,6 +110,7 @@ internal class VpnCoreController(
     override fun rebindNetwork(): Boolean = try {
         checkNotNull(server).also { core ->
             physicalNetwork()
+            core.wake()
             // A changed Android interface resets sockets through the native monitor.
             if (!updateInterface()) core.resetNetwork()
         }
@@ -117,6 +118,12 @@ internal class VpnCoreController(
     } catch (error: Throwable) {
         SafeLog.w(TAG, "Failed to reopen VPN sockets", error)
         false
+    }
+
+    @Synchronized
+    override fun wake() {
+        runCatching { server?.wake() }
+            .onFailure { SafeLog.w(TAG, "Failed to wake VPN core", it) }
     }
 
     private fun physicalNetwork(): Network =

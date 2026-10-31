@@ -2,6 +2,7 @@ package com.noki.vpn.vpn
 
 import android.content.Context
 import android.net.ConnectivityManager
+import android.net.LinkProperties
 import android.net.Network
 import android.net.NetworkCapabilities
 import android.os.Build
@@ -39,7 +40,7 @@ internal class AndroidUnderlyingNetworkSource(
             candidate = UnderlyingNetworkSnapshot(
                 network = selected.value,
                 kind = selected.kind,
-                signature = "${selected.value}:${selected.kind.name}:${selected.isValidated}:${selected.isNotMetered}",
+                signature = connectionSignature(selected.value, selected.kind, linkProperties),
                 vpnShouldBeMetered = vpnShouldBeMetered,
                 details = buildString {
                     append("vpn_metered=$vpnShouldBeMetered; networks=")
@@ -85,6 +86,16 @@ internal class AndroidUnderlyingNetworkSource(
     }
 
     companion object {
+        internal fun connectionSignature(
+            network: Network,
+            kind: EndpointRankingPolicy.NetworkKind,
+            links: LinkProperties?,
+        ): String = listOf(
+            network.toString(), kind.name, links?.interfaceName.orEmpty(),
+            links?.linkAddresses.orEmpty().map { it.toString() }.sorted().joinToString(","),
+            links?.routes.orEmpty().map { it.toString() }.sorted().joinToString(","),
+        ).joinToString(":")
+
         internal fun networkKind(
             hasWifiTransport: Boolean,
             hasCellularTransport: Boolean,

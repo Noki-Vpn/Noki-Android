@@ -88,6 +88,7 @@ class AppVpnService : VpnService() {
     private lateinit var statsCoordinator: VpnStatsCoordinator
     private var runtimeCoreSequence: Long = 0L
     private val readinessMutex = Mutex()
+    private val wakeProbeInFlight = AtomicBoolean(false)
     private lateinit var warmupController: VpnWarmupController<BackendVpnSession>
     private lateinit var connectionPreparer: VpnConnectionPreparer
     private lateinit var temporaryVpnCoordinator: TemporaryVpnSessionCoordinator
@@ -165,12 +166,7 @@ class AppVpnService : VpnService() {
             updateActiveNotification = ::updateActiveNotification,
             pollNotifications = ::pollAppNotifications,
         )
-        screenStateMonitor = VpnScreenStateMonitor(this) { screenOn ->
-            notificationController.setScreenOn(screenOn)
-            if (screenOn && ruSession != null && currentState == VpnConnectionState.CONNECTED) {
-                backgroundScope.launch { checkRuAuthorization(force = true) }
-            }
-        }
+        screenStateMonitor = VpnScreenStateMonitor(this, ::handleScreenStateChanged)
         val tunFactory = AndroidTunInterfaceFactory(this)
         ruTunFactory = tunFactory
         underlyingNetworkSource = AndroidUnderlyingNetworkSource(this)
@@ -2278,6 +2274,48 @@ class AppVpnService : VpnService() {
         return CancelableTask(job::cancel)
     }
 
+    private fun handleScreenStateChanged(screenOn: Boolean) {
+        notificationController.setScreenOn(screenOn)
+        if (!screenOn || currentState != VpnConnectionState.CONNECTED) return
+        networkMonitor.refresh()
+        checkConnectionAfterWake()
+        if (ruSession != null) backgroundScope.launch { checkRuAuthorization(force = true) }
+    }
+
+    private fun checkConnectionAfterWake() {
+        val generation = connectionOrchestrator.currentGenerationId()
+        val activeTunnel = tunnel ?: return
+        val network = underlyingNetworkSource.currentSnapshot() ?: return
+        fun admitted(): Boolean = connectionOrchestrator.isCurrent(generation) && tunnel === activeTunnel &&
+            currentState == VpnConnectionState.CONNECTED && !connectionOrchestrator.transitionSnapshot().active &&
+            activeUnderlyingNetworkSignature == network.signature &&
+            underlyingNetworkSource.currentSnapshot()?.signature == network.signature
+        if (!admitted() || !wakeProbeInFlight.compareAndSet(false, true)) return
+        backgroundScope.launch {
+            try {
+                val resumed = connectionOrchestrator.withLifecycleLock {
+                    if (!admitted()) false else {
+                        connectionOrchestrator.wake()
+                        watchdogController.resetNetworkEvidence(preserveHealthyEvidence = true)
+                        true
+                    }
+                }
+                if (!resumed) return@launch
+                val owner = watchdogController.currentOwner()
+                val latency = measureRuntimeReadiness(recovery = false, watchdog = true)
+                connectionOrchestrator.withLifecycleLock {
+                    if (!admitted() || (owner != null && !watchdogController.accepts(owner))) return@withLifecycleLock
+                    if (VpnReadinessPolicy.accept(latency)) watchdogController.recordEvidence(WatchdogEvidence.VPN_PROBE)
+                    // A failed HTTP target does not prove existing application sockets are broken.
+                    SettingsRepository(this@AppVpnService).recordAppLog("vpn", message = "vpn_wake_probe",
+                        details = "healthy=${VpnReadinessPolicy.accept(latency)}; runtime_preserved=true")
+                }
+            } finally {
+                wakeProbeInFlight.set(false)
+            }
+        }
+    }
+
     private fun startNetworkChangeMonitor(initialKind: EndpointRankingPolicy.NetworkKind) {
         stopNetworkChangeMonitor()
         activeEndpointNetworkKind = initialKind
@@ -2334,7 +2372,10 @@ class AppVpnService : VpnService() {
             activeSignature = previousSignature,
             nextSignature = nextUnderlyingSnapshot.signature,
         )
-        if (plan.action == VpnHandoverPolicy.Action.NoAction) return
+        if (plan.action == VpnHandoverPolicy.Action.NoAction) {
+            connectionOrchestrator.updateUnderlay(nextUnderlyingSnapshot)
+            return
+        }
         activeEndpointNetworkKind = nextKind
         SettingsRepository(this).recordAppLog(
             category = "vpn",
@@ -2380,19 +2421,17 @@ class AppVpnService : VpnService() {
             connectionOrchestrator.withLifecycleLock {
                 if (!admitted() || activeUnderlyingNetworkSignature == next.signature) return@withLifecycleLock
                 val reopened = connectionOrchestrator.rebindNetwork()
-                val ready = if (reopened) measureRuntimeReadiness(recovery = true) else null
-                if (reopened && VpnReadinessPolicy.accept(ready)) {
+                if (reopened) {
                     if (!admitted()) return@withLifecycleLock
                     connectionOrchestrator.updateUnderlay(next)
                     activeEndpointNetworkKind = next.kind
                     delayedTaskScheduler.cancel(transientRecoveryOwner)
-                    watchdogController.recordEvidence(WatchdogEvidence.VPN_PROBE)
                     if (sessionId != null) backgroundScope.launch { checkRuAuthorization(force = true) }
                     SettingsRepository(this@AppVpnService).recordAppLog("vpn",
                         message = if (sessionId != null) "ru_wireguard_underlay_rebound" else "underlay_rebound",
                         details = "tun_preserved=true; runtime_preserved=true")
                 } else if (admitted()) {
-                    // Socket reopen failure never replaces an otherwise authorized runtime.
+                    // Retry only a failed bind; HTTP readiness is owned by the watchdog.
                     delayedTaskScheduler.schedule(transientRecoveryOwner, 2_000L) {
                         if (admitted()) rebindUnderlyingNetwork(next)
                     }
