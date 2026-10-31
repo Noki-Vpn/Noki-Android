@@ -1,5 +1,6 @@
 buildscript {
     configurations.getByName("classpath").resolutionStrategy.force(
+        "com.google.guava:guava:33.7.2-jre",
         "io.netty:netty-common:4.1.137.Final",
         "io.netty:netty-handler:4.1.137.Final",
         "io.netty:netty-handler-proxy:4.1.137.Final",
@@ -28,6 +29,13 @@ plugins {
 
 allprojects {
     configurations.configureEach {
+        resolutionStrategy.eachDependency {
+            if (requested.group == "com.google.guava" && requested.name == "guava") {
+                val edition = if (requested.version?.endsWith("-android") == true) "android" else "jre"
+                useVersion("33.7.2-$edition")
+                because("CVE-2026-102554")
+            }
+        }
         resolutionStrategy.force(
             "io.netty:netty-common:4.1.137.Final",
             "io.netty:netty-handler:4.1.137.Final",
