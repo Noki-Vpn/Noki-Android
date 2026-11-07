@@ -1,241 +1,279 @@
 package com.noki.vpn.vpn
 
 import android.content.Context
-import com.noki.vpn.data.*
-import kotlinx.coroutines.*
-import java.util.Locale
+import android.net.LocalServerSocket
+import android.os.ParcelFileDescriptor
+import android.system.Os
+import android.system.OsConstants
+import com.noki.vpn.data.SettingsRepository
+import com.noki.vpn.data.StoredSettings
+import java.io.File
+import java.io.FileDescriptor
+import java.net.InetAddress
+import java.net.InetSocketAddress
 import java.util.UUID
+import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicBoolean
+import kotlinx.coroutines.*
 
-sealed interface YoutubeConnectionConfig {
-    data class WireGuard(val wireguard: BackendRuWireGuardConfig, val privateKey: ByteArray) : YoutubeConnectionConfig
-    data class SelectedTransport(val profile: VlessProfile) : YoutubeConnectionConfig
+data class YoutubeConnectionConfig(val port: Int) {
+    init { require(port in 1..65535) { "youtube_port_invalid" } }
 }
 
-/** Owns only the additional admission; AppVpnService keeps the single runtime and TUN. */
+internal class YoutubeEndpoint(val port: Int, val descriptor: FileDescriptor,
+                               private val closeDescriptor: (FileDescriptor) -> Unit) : AutoCloseable {
+    override fun close() = closeDescriptor(descriptor)
+}
+
+internal interface YoutubeRuntime {
+    suspend fun start()
+    suspend fun awaitExit(): Int
+    fun stop()
+}
+
+/** Owns one reserved loopback endpoint and child; AppVpnService retains the core and TUN. */
 internal class YoutubeConnection(
-    private val context: Context,
     private val scope: CoroutineScope,
-    private val repository: SettingsRepository,
-    private val api: () -> BackendApiClient,
-    private val onConfigurationChanged: () -> Unit,
+    private val networkIdentity: () -> String?,
+    private val endpointFactory: () -> YoutubeEndpoint,
+    private val runtimeFactory: (YoutubeEndpoint, String) -> YoutubeRuntime,
+    private val onFailure: (Throwable) -> Unit,
+    private val retryMillis: Long = 2_000,
 ) {
-    @Volatile private var configuration: YoutubeConnectionConfig? = null
-    @Volatile private var validUntil = 0L
-    @Volatile private var target: String? = null
+    private var endpoint: YoutubeEndpoint? = null
+    private var target: String? = null
+    private var network: String? = null
     private var job: Job? = null
-    private var expiry: Job? = null
-    @Volatile private var sequence = 0L
-    private var failedTarget: String? = null
+    private var runtime: YoutubeRuntime? = null
+    private var sequence = 0L
+    private var rejectedTarget: String? = null
 
-    fun configFor(settings: StoredSettings, primary: VlessProfile?): YoutubeConnectionConfig? =
-        targetFor(settings, primary)?.let { requested ->
-            configuration.takeIf { target == requested && validUntil > System.currentTimeMillis() }
+    @Synchronized fun configFor(settings: StoredSettings): YoutubeConnectionConfig? {
+        val requested = targetFor(settings)
+        if (requested == null) { stop(); return null }
+        if (requested == rejectedTarget) return null
+        if (requested != target) {
+            stop()
+            target = requested
         }
+        val selected = endpoint ?: try { endpointFactory().also { endpoint = it } } catch (error: Exception) {
+            rejectedTarget = requested
+            onFailure(error)
+            return null
+        }
+        return YoutubeConnectionConfig(selected.port)
+    }
 
-    @Synchronized fun start(settings: StoredSettings, primary: VlessProfile?) {
-        val next = targetFor(settings, primary)
-        if (next != null && next == failedTarget) return
-        if (next == target && job?.isActive == true) return
-        stop()
-        if (next == null) return
-        target = next
+    @Synchronized fun start(settings: StoredSettings) {
+        if (configFor(settings) == null) return
+        val nextNetwork = networkIdentity()
+        if (network == nextNetwork && job?.isActive == true) return
+        stopRuntime()
+        network = nextNetwork
         val owner = sequence
+        val selected = checkNotNull(endpoint)
         job = scope.launch {
-            try {
-                run(owner, next, primary)
-            } catch (cancelled: CancellationException) {
-                throw cancelled
-            } catch (error: Exception) {
-                publish(owner, null)
-                runCatching { repository.recordAppLog("vpn", level = "error", message = "youtube_prepare_failed",
-                    errorType = error.javaClass.simpleName) }
+            while (currentCoroutineContext().isActive) {
+                var child: YoutubeRuntime? = null
+                try {
+                    synchronized(this@YoutubeConnection) {
+                        if (owner != sequence) return@launch
+                        val signature = networkIdentity()
+                        if (signature != null) {
+                            runtime?.stop()
+                            runtime = null
+                            network = signature
+                            child = runtimeFactory(selected, signature)
+                            runtime = child
+                        }
+                    }
+                    child?.let {
+                        withTimeout(5_000) { it.start() }
+                        error("youtube_byedpi_exited_${it.awaitExit()}")
+                    }
+                } catch (cancelled: CancellationException) {
+                    if (cancelled !is TimeoutCancellationException) throw cancelled
+                    onFailure(cancelled)
+                } catch (error: Exception) {
+                    onFailure(error)
+                } finally {
+                    synchronized(this@YoutubeConnection) {
+                        child?.let { current ->
+                            if (runCatching { current.stop() }.onFailure(onFailure).isSuccess && runtime === current) runtime = null
+                        }
+                    }
+                }
+                delay(retryMillis)
             }
         }
     }
 
     @Synchronized fun stop() {
-        sequence++
-        failedTarget = null
+        stopRuntime()
+        endpoint?.let { runCatching { it.close() }.onFailure(onFailure) }
+        endpoint = null
         target = null
+        network = null
+        rejectedTarget = null
+    }
+
+    private fun stopRuntime() {
+        sequence++
         job?.cancel()
         job = null
-        expiry?.cancel()
-        expiry = null
-        configuration = null
-        validUntil = 0L
-    }
-
-    @Synchronized fun rejectConfiguration() {
-        val failed = target
-        stop()
-        failedTarget = failed
-    }
-
-    @Synchronized private fun publish(owner: Long, value: YoutubeConnectionConfig?, expiresAt: Long = 0L) {
-        if (owner != sequence) return
-        val changed = !sameConfiguration(configuration, value)
-        configuration = value
-        validUntil = expiresAt
-        expiry?.cancel()
-        expiry = value?.let {
-            scope.launch {
-                delay((expiresAt - System.currentTimeMillis()).coerceAtLeast(0))
-                publish(owner, null)
-            }
+        runtime?.let { current ->
+            if (runCatching { current.stop() }.onFailure(onFailure).isSuccess) runtime = null
         }
-        if (changed) onConfigurationChanged()
-    }
-
-    private suspend fun run(owner: Long, expectedTarget: String, primary: VlessProfile?) {
-        var grant: BackendYoutubeAccess? = null
-        val pair = WireGuardKeyStore.android(context).getOrCreate()
-        try {
-            var keyId: String? = null
-            var requestId = UUID.randomUUID().toString()
-            var transientFailures = 0
-            while (currentCoroutineContext().isActive && owner == sequence) {
-                try {
-                    val settings = repository.load()
-                    check(targetFor(settings, primary) == expectedTarget) { "youtube_selection_changed" }
-                    if (grant?.let { it.expiresAtEpochMillis <= System.currentTimeMillis() } == true) {
-                        grant = null
-                        requestId = UUID.randomUUID().toString()
-                    }
-                    val previous = grant
-                    val response = authorized { client, token, current ->
-                        check(targetFor(current, primary) == expectedTarget) { "youtube_selection_changed" }
-                        if (previous == null) {
-                            if (keyId == null) {
-                                keyId = DeviceIdentity.withChallengeTransaction {
-                                    val proof = client.createDeviceChallenge(token, current.backendDeviceId)
-                                    client.registerRuWireGuardKey(token, current.backendDeviceId, current.backendDeviceKey,
-                                        proof.nonce, DeviceIdentity.signChallenge(proof.nonce), pair.publicKeyBase64()).id
-                                }
-                            }
-                            DeviceIdentity.withChallengeTransaction {
-                                val proof = client.createDeviceChallenge(token, current.backendDeviceId)
-                                client.createYoutubeAccess(token, requestId, current.backendDeviceId, current.backendDeviceKey,
-                                    proof.nonce, DeviceIdentity.signChallenge(proof.nonce), checkNotNull(keyId),
-                                    primary?.endpointCode?.takeIf(String::isNotBlank))
-                            }
-                        } else if (previous.status == "ready") {
-                            client.renewYoutubeAccess(token, current.backendDeviceId, current.backendDeviceKey, previous)
-                        } else {
-                            client.pollYoutubeAccess(token, current.backendDeviceId, current.backendDeviceKey, previous.grantId)
-                        }
-                    }
-                    if (previous != null) require(response.grantId == previous.grantId && response.mode == previous.mode &&
-                        response.generation in previous.generation..(previous.generation +
-                            if (previous.status == "ready" || response.status == "blocked") 1 else 0)) {
-                        "youtube_access_identity_changed"
-                    }
-                    grant = response
-                    transientFailures = 0
-                    if (response.status == "blocked") {
-                        publish(owner, null)
-                        if (needsFreshAdmission(response, System.currentTimeMillis())) {
-                            grant = null
-                            requestId = UUID.randomUUID().toString()
-                            delay(2_000)
-                            continue
-                        }
-                        awaitCancellation()
-                    }
-                    if (response.status == "ready") {
-                        publish(owner, runtimeConfig(response, primary, checkNotNull(keyId), pair.privateKey), response.expiresAtEpochMillis)
-                        delay(renewDelayMillis(response.expiresAtEpochMillis, System.currentTimeMillis()))
-                    } else {
-                        delay(2_000)
-                    }
-                } catch (cancelled: CancellationException) {
-                    throw cancelled
-                } catch (error: Exception) {
-                    if (!BackendRetryPolicy.isTransient(error)) {
-                        publish(owner, null)
-                        repository.recordAppLog("vpn", level = "error", message = "youtube_access_blocked",
-                            errorType = error.javaClass.simpleName)
-                        awaitCancellation()
-                    }
-                    delay(transientRetryDelayMillis(transientFailures))
-                    transientFailures = (transientFailures + 1).coerceAtMost(4)
-                }
-            }
-        } finally {
-            publish(owner, null)
-            pair.privateKey.fill(0)
-            // shortcut: offline revokes expire on the server within 120s; persist retries if the TTL grows.
-            grant?.let { last -> withContext(NonCancellable) {
-                withTimeoutOrNull(6_000) { runCatching { api().revokeYoutubeAccess(last.grantId, last.revokeToken) } }
-            } }
-        }
-    }
-
-    private suspend fun <T> authorized(action: suspend (BackendApiClient, String, StoredSettings) -> T): T {
-        val client = api()
-        var current = repository.load()
-        try {
-            return action(client, checkNotNull(current.backendAccessToken), current)
-        } catch (error: BackendException) {
-            if (error.statusCode != 401) throw error
-            checkNotNull(AuthTokenRefresher(repository, client,
-                onRevocationPending = { PendingLogoutRevocationWorker.enqueue(context) }).refreshStoredTokens()) {
-                "auth_required"
-            }
-            current = repository.load()
-            return action(client, checkNotNull(current.backendAccessToken), current)
-        }
-    }
-
-    private fun targetFor(settings: StoredSettings, primary: VlessProfile?): String? {
-        if (!settings.isAuthenticated || settings.userProfile.isFreePlan ||
-            !settings.advancedSettings.youtubeNoAdsEnabled || settings.backendDeviceId.isBlank()) return null
-        return listOf(settings.userProfile.backendUserId, settings.backendDeviceId, settings.backendDeviceKey,
-            primary?.endpointCode.orEmpty(), primary?.let(::transportFamily).orEmpty()).joinToString("|")
     }
 
     companion object {
-        internal fun transientRetryDelayMillis(failures: Int): Long =
-            (2_000L shl failures.coerceIn(0, 4)).coerceAtMost(30_000L)
+        internal fun targetFor(settings: StoredSettings): String? {
+            if (!settings.isAuthenticated || settings.userProfile.isFreePlan ||
+                !settings.advancedSettings.youtubeNoAdsEnabled || settings.backendDeviceId.isBlank()) return null
+            return listOf(settings.userProfile.backendUserId, settings.backendDeviceId, settings.backendDeviceKey).joinToString("|")
+        }
 
-        internal fun needsFreshAdmission(grant: BackendYoutubeAccess, now: Long): Boolean =
-            grant.status == "blocked" && grant.expiresAtEpochMillis <= now
-
-        internal fun sameConfiguration(previous: YoutubeConnectionConfig?, next: YoutubeConnectionConfig?): Boolean =
-            if (previous is YoutubeConnectionConfig.WireGuard && next is YoutubeConnectionConfig.WireGuard)
-                previous.wireguard == next.wireguard else previous == next
-
-        internal fun renewDelayMillis(expiresAt: Long, now: Long): Long =
-            ((expiresAt - now).coerceAtLeast(0L) * 2 / 3).coerceAtLeast(1L)
-
-        internal fun runtimeConfig(grant: BackendYoutubeAccess, primary: VlessProfile?, keyId: String,
-                                   privateKey: ByteArray): YoutubeConnectionConfig {
-            require(grant.status == "ready") { "youtube_access_not_ready" }
-            return when (grant.mode) {
-                "wireguard" -> {
-                    require(grant.publicKeyId == keyId) { "youtube_access_key_mismatch" }
-                    YoutubeConnectionConfig.WireGuard(checkNotNull(grant.wireguard), privateKey)
+        fun android(context: Context, scope: CoroutineScope, underlay: AndroidUnderlyingNetworkSource,
+                    protectSocket: (Int) -> Boolean): YoutubeConnection {
+            val repository = SettingsRepository(context)
+            fun log(message: String, details: String? = null, error: Throwable? = null) {
+                runCatching { repository.recordAppLog("vpn", level = if (error == null) "info" else "error",
+                    message = message, details = details, errorType = error?.javaClass?.simpleName) }
+            }
+            return YoutubeConnection(scope, { underlay.currentSnapshot()?.signature }, {
+                val fd = Os.socket(OsConstants.AF_INET, OsConstants.SOCK_STREAM, OsConstants.IPPROTO_TCP)
+                try {
+                    Os.bind(fd, InetAddress.getByName("127.0.0.1"), 0)
+                    Os.listen(fd, 128)
+                    YoutubeEndpoint((Os.getsockname(fd) as InetSocketAddress).port, fd, Os::close)
+                } catch (error: Exception) {
+                    Os.close(fd)
+                    throw error
                 }
-                "selected_transport" -> {
-                    require(primary != null && primary.endpointCode.isNotBlank()) { "youtube_primary_transport_missing" }
-                    val profile = EndpointSelector.profileFromCandidate(checkNotNull(grant.endpoint), checkNotNull(grant.vpnSecret), grant.vpnUsername.orEmpty())
-                    require(transportFamily(profile) == transportFamily(primary) &&
-                        profile.proxyType.lowercase(Locale.ROOT) in setOf("vless", "hysteria", "hysteria2", "hy2", "naive")) {
-                        "youtube_transport_mismatch"
+            }, { endpoint, signature ->
+                val snapshot = checkNotNull(underlay.currentSnapshot()).also {
+                    check(it.signature == signature) { "youtube_underlay_changed" }
+                }
+                val network = checkNotNull(snapshot.network) { "youtube_underlay_unavailable" }
+                ByeDpiProcess(File(context.applicationInfo.nativeLibraryDir, "libnoki_byedpi.so"), endpoint,
+                    bindSocket = { fd ->
+                        check(underlay.currentSnapshot()?.signature == signature) { "youtube_underlay_changed" }
+                        ParcelFileDescriptor.dup(fd).use { socket ->
+                            check(protectSocket(socket.fd)) { "youtube_socket_protect_failed" }
+                            network.bindSocket(socket.fileDescriptor)
+                        }
+                        check(underlay.currentSnapshot()?.signature == signature) { "youtube_underlay_changed" }
+                    },
+                    onProfile = { log("youtube_byedpi_ready", it) },
+                    onDiagnostic = { log("youtube_byedpi_native", it) })
+            }, { log("youtube_byedpi_failed", details = it.message, error = it) })
+        }
+    }
+}
+
+private class ByeDpiProcess(
+    private val executable: File,
+    private val endpoint: YoutubeEndpoint,
+    private val bindSocket: (FileDescriptor) -> Unit,
+    private val onProfile: (String) -> Unit,
+    private val onDiagnostic: (String) -> Unit,
+) : YoutubeRuntime {
+    private val ready = CompletableDeferred<Unit>()
+    private val exited = CompletableDeferred<Int>()
+    private val stopped = AtomicBoolean(false)
+    private var process: Process? = null
+    private var server: LocalServerSocket? = null
+    private var protector: Thread? = null
+    private var output: Thread? = null
+
+    override suspend fun start() { launch(); ready.await() }
+
+    @Synchronized private fun launch() {
+        check(!stopped.get()) { "youtube_byedpi_stopped" }
+        check(process == null && executable.canExecute()) { "youtube_byedpi_binary_unavailable" }
+        val name = "noki-byedpi-${UUID.randomUUID()}"
+        val listener = LocalServerSocket(name)
+        server = listener
+        protector = Thread({
+            try {
+                while (!stopped.get()) listener.accept().use { socket ->
+                    socket.soTimeout = 2_000
+                    var descriptors: Array<FileDescriptor>? = null
+                    val accepted = runCatching {
+                        check(!stopped.get()) { "youtube_byedpi_stopped" }
+                        check(socket.peerCredentials.uid == android.os.Process.myUid()) { "youtube_protect_peer_invalid" }
+                        val request = socket.inputStream.read()
+                        check(request >= 0) { "youtube_protect_request_empty" }
+                        descriptors = socket.ancillaryFileDescriptors
+                        if (request == 2) {
+                            check(descriptors.isNullOrEmpty()) { "youtube_listener_request_invalid" }
+                            socket.setFileDescriptorsForSend(arrayOf(endpoint.descriptor))
+                        } else {
+                            check(request == '1'.code) { "youtube_protect_request_invalid" }
+                            bindSocket(checkNotNull(descriptors).single())
+                        }
+                        check(!stopped.get()) { "youtube_byedpi_stopped" }
+                    }.isSuccess
+                    try {
+                        socket.outputStream.write(if (accepted) 0 else 1)
+                        socket.outputStream.flush()
+                    } finally {
+                        runCatching { socket.setFileDescriptorsForSend(null) }
+                        descriptors?.forEach { runCatching { Os.close(it) } }
                     }
-                    YoutubeConnectionConfig.SelectedTransport(profile)
                 }
-                else -> error("youtube_access_mode_invalid")
+            } catch (error: Exception) {
+                if (!stopped.get()) {
+                    ready.completeExceptionally(error)
+                    process?.destroy()
+                }
             }
-        }
+        }, "noki-byedpi-protect").apply { isDaemon = true; start() }
+        val child = ProcessBuilder(executable.absolutePath, "--ip", "127.0.0.1", "--port", endpoint.port.toString(),
+            "--max-conn", "4096", "--conn-ip", "0.0.0.0", "--no-udp", "--no-domain",
+            "--proto", "tls,http", "--protect-path", "@$name", "--noki-listen-path", "@$name",
+            "--noki-android-profile", "--noki-parent", android.os.Process.myPid().toString()).redirectErrorStream(true).start()
+        process = child
+        output = Thread({
+            try {
+                child.inputStream.bufferedReader().useLines { lines ->
+                    for (line in lines) {
+                        if (line.startsWith("NOKI_READY ")) {
+                            val match = Regex("NOKI_READY port=([0-9]+) profile=(linux-md5sig|android-disorder-md5sig-unavailable)")
+                                .matchEntire(line) ?: error("youtube_byedpi_readiness_invalid")
+                            check(match.groupValues[1].toInt() == endpoint.port) { "youtube_byedpi_port_invalid" }
+                            onProfile(match.groupValues[2])
+                            ready.complete(Unit)
+                        } else if (line.isNotBlank()) onDiagnostic(line.take(512))
+                    }
+                }
+                val code = child.waitFor()
+                exited.complete(code)
+                ready.completeExceptionally(IllegalStateException("youtube_byedpi_exited_$code"))
+            } catch (error: Exception) {
+                ready.completeExceptionally(error)
+                exited.completeExceptionally(error)
+                child.destroy()
+            }
+        }, "noki-byedpi-output").apply { isDaemon = true; start() }
+    }
 
-        private fun transportFamily(profile: VlessProfile): String {
-            fun normalized(value: String): String = when (val lower = value.lowercase(Locale.ROOT)) {
-                "raw" -> "tcp"
-                "hysteria2", "hy2" -> "hysteria"
-                else -> lower
+    override suspend fun awaitExit(): Int = exited.await()
+
+    @Synchronized override fun stop() {
+        stopped.set(true)
+        runCatching { server?.close() }
+        process?.let { child ->
+            child.destroy()
+            if (!child.waitFor(1, TimeUnit.SECONDS)) {
+                child.destroyForcibly()
+                check(child.waitFor(1, TimeUnit.SECONDS)) { "youtube_byedpi_stop_timeout" }
             }
-            return listOf(normalized(profile.proxyType), normalized(profile.transport), normalized(profile.security),
-                profile.transportMode.lowercase(Locale.ROOT)).joinToString(":")
+            runCatching { child.inputStream.close() }
+            runCatching { child.outputStream.close() }
         }
+        for (thread in listOfNotNull(protector, output)) if (thread !== Thread.currentThread()) thread.join(500)
+        ready.cancel()
+        exited.cancel()
     }
 }

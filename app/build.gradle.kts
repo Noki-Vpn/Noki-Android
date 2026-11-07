@@ -53,9 +53,20 @@ val geositeSourceSha256 = "09E547AB2E7B76A24081243EF8E7EF0432D70C2551F2E7EFCA1A3
 val geositeLicenseFile = layout.projectDirectory.file("src/main/assets/licenses/geosite/LICENSE")
 val prismalAarFile = layout.projectDirectory.file("libs/prismal-1.0.3.aar")
 val prismalAarSha256 = "40D5EAFC3B68554E0D5E159EA02ECDA8CA86EB32A43DC1B3BAE5C65344C08C2A"
+val byedpiSourceFile = layout.projectDirectory.file("libs/byedpi.SOURCE.zip")
+val byedpiPinFile = layout.projectDirectory.file("libs/byedpi.source.properties")
+val byedpiSourceHash = requireNotNull(Properties().apply {
+    byedpiPinFile.asFile.inputStream().use(::load)
+}.getProperty("source")).also { require(it.matches(Regex("[a-f0-9]{64}"))) { "Invalid ByeDPI source pin" } }
+// ndk-build cannot compile the workspace's Windows paths containing spaces.
+val byedpiWorkDirectory = File(gradle.gradleUserHomeDir, "noki-byedpi/android-$byedpiSourceHash")
+val byedpiSources = byedpiWorkDirectory.resolve("source")
+val byedpiNativeOutput = byedpiWorkDirectory.resolve("libs")
+val byedpiPackagedLibraries = layout.buildDirectory.dir("generated/byedpi/jniLibs")
+val byedpiPackagedAssets = layout.buildDirectory.dir("generated/byedpi/assets")
 val supportedAbis = listOf("arm64-v8a", "armeabi-v7a", "x86_64")
-val expectedReleaseVersionCode = 317
-val expectedReleaseVersionName = "2.3.1"
+val expectedReleaseVersionCode = 319
+val expectedReleaseVersionName = "2.3.3"
 
 fun String.toBuildConfigString(): String =
     "\"${replace("\\", "\\\\").replace("\"", "\\\"")}\""
@@ -76,6 +87,7 @@ fun sha256Hex(file: File): String {
 android {
     namespace = "com.noki.vpn"
     compileSdk = 37
+    ndkVersion = "29.0.14206865"
 
     defaultConfig {
         applicationId = "com.noki.vpn"
@@ -165,11 +177,17 @@ android {
     }
 
     packaging {
+        jniLibs.useLegacyPackaging = true
         // Dependencies also ship x86, but libbox supports the three declared ABIs.
         jniLibs.excludes += "/lib/x86/**"
         resources {
             excludes += "/META-INF/{AL2.0,LGPL2.1}"
         }
+    }
+
+    sourceSets.getByName("main") {
+        jniLibs.srcDir(byedpiPackagedLibraries.get().asFile)
+        assets.srcDir(byedpiPackagedAssets.get().asFile)
     }
 }
 
@@ -230,6 +248,76 @@ tasks.register("verifyPrismalAar") {
         }
     }
 }
+
+val verifyByeDpiSource = tasks.register("verifyByeDpiSource") {
+    inputs.files(byedpiSourceFile, byedpiPinFile)
+    doLast {
+        val pin = Properties().apply { byedpiPinFile.asFile.inputStream().use(::load) }
+        require(pin.getProperty("version") == "0.17.3" && pin.getProperty("revision") == "1") {
+            "Unsupported ByeDPI source version"
+        }
+        require(pin.getProperty("source") == byedpiSourceHash && sha256Hex(byedpiSourceFile.asFile) == byedpiSourceHash) {
+            "ByeDPI source checksum mismatch"
+        }
+        ZipFile(byedpiSourceFile.asFile).use { archive ->
+            val names = archive.entries().asSequence().map { it.name }.toList()
+            require(names.size == names.toSet().size && names.size < 256) { "Invalid ByeDPI source archive" }
+            require(names.all { !it.startsWith('/') && !it.contains('\\') && ':' !in it && ".." !in it.split('/') }) {
+                "Unsafe ByeDPI source archive path"
+            }
+            for (member in listOf("Android.mk", "LICENSE", "UPSTREAM.json", "noki.c", "noki.h")) {
+                require(archive.getEntry(member) != null) { "ByeDPI source missing: $member" }
+            }
+        }
+    }
+}
+
+val prepareByeDpiSources = tasks.register<Sync>("prepareByeDpiSources") {
+    dependsOn(verifyByeDpiSource)
+    from(zipTree(byedpiSourceFile))
+    into(byedpiSources)
+}
+
+val buildByeDpiNative = tasks.register<Exec>("buildByeDpiNative") {
+    dependsOn(prepareByeDpiSources)
+    inputs.dir(byedpiSources)
+    inputs.property("abis", supportedAbis)
+    inputs.property("ndk", android.ndkVersion)
+    outputs.dir(byedpiNativeOutput)
+    doFirst {
+        require(' ' !in byedpiWorkDirectory.absolutePath) { "ndk-build requires a Gradle user home without spaces" }
+        val ndk = androidComponents.sdkComponents.sdkDirectory.get().asFile.resolve("ndk/${android.ndkVersion}")
+        val windows = System.getProperty("os.name").startsWith("Windows")
+        val builder = ndk.resolve(if (windows) "ndk-build.cmd" else "ndk-build")
+        val arguments = listOf("NDK_PROJECT_PATH=null", "APP_BUILD_SCRIPT=${byedpiSources.resolve("Android.mk")}",
+            "APP_PLATFORM=android-26", "APP_ABI=${supportedAbis.joinToString(" ")}", "NDK_DEBUG=0",
+            "NDK_OUT=${byedpiWorkDirectory.resolve("obj")}", "NDK_LIBS_OUT=$byedpiNativeOutput", "-B", "-j3")
+        workingDir(byedpiSources)
+        commandLine(if (windows) listOf("cmd", "/d", "/c", builder.absolutePath) + arguments
+            else listOf(builder.absolutePath) + arguments)
+    }
+}
+
+val packageByeDpiNative = tasks.register<Sync>("packageByeDpiNative") {
+    dependsOn(buildByeDpiNative)
+    from(byedpiNativeOutput) { include("*/noki_byedpi"); rename("noki_byedpi", "libnoki_byedpi.so") }
+    into(byedpiPackagedLibraries)
+    doLast {
+        for (abi in supportedAbis) require(byedpiPackagedLibraries.get().file("$abi/libnoki_byedpi.so").asFile.isFile) {
+            "ByeDPI executable missing ABI: $abi"
+        }
+    }
+}
+
+val packageByeDpiLicense = tasks.register<Sync>("packageByeDpiLicense") {
+    dependsOn(verifyByeDpiSource)
+    from(zipTree(byedpiSourceFile)) { include("LICENSE") }
+    into(byedpiPackagedAssets.map { it.dir("licenses/byedpi") })
+}
+
+tasks.matching { it.name.endsWith("JniLibFolders") }.configureEach { dependsOn(packageByeDpiNative) }
+tasks.matching { it.name.startsWith("merge") && it.name.endsWith("Assets") }.configureEach { dependsOn(packageByeDpiLicense) }
+tasks.matching { it.name.contains("lint", ignoreCase = true) }.configureEach { dependsOn(packageByeDpiNative, packageByeDpiLicense) }
 
 tasks.register("verifyGeositeSource") {
     inputs.files(geositeFile, geositeSourceFile, geositeLicenseFile)

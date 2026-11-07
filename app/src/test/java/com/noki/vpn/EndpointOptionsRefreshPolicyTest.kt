@@ -22,13 +22,14 @@ class EndpointOptionsRefreshPolicyTest {
         val state = AppUiState(userProfile = UserProfile(selectedCountryCode = ""),
             endpointOptions = listOf(option), endpointOptionsCountryCode = "")
         val choices = manualEndpointOptionsForCurrentCountry(state)
-        assertEquals(2, choices.size)
+        assertEquals(1, choices.size)
+        assertEquals("quic", choices.single().transportMode)
         assertTrue(choices.all { isManualEndpointSelectable(it, state.endpointOptions, "", "") })
         assertFalse(isManualEndpointSelectable(choices.first(), state.endpointOptions, null, ""))
     }
 
     @Test
-    fun `MultiHop options belong to the selected pair and preserve the manual carrier`() {
+    fun `MultiHop options belong to the selected pair and normalize the retired carrier`() {
         val selection = com.noki.vpn.data.MultiHopSettings(true,
             com.noki.vpn.data.HopSelection(com.noki.vpn.data.ServerSelectionMode.SERVER, nodeId = "entry"),
             com.noki.vpn.data.HopSelection(com.noki.vpn.data.ServerSelectionMode.SERVER, nodeId = "exit"))
@@ -41,8 +42,8 @@ class EndpointOptionsRefreshPolicyTest {
         val routed = direct.copy(session = direct.session.copy(multiHop = com.noki.vpn.data.BackendMultiHopSession(
             selection, "entry", "exit", "192.0.2.1", "a".repeat(64))))
         val result = EndpointOptionsStateReducer.applyEndpointOptions(state, routed, emptyList())!!.state
-        assertEquals("tls|nokinv|tcp", result.advancedSettings.manualEndpointGroupKey)
-        assertEquals("tcp", result.profile.transportMode)
+        assertEquals("tls|nokinv|quic", result.advancedSettings.manualEndpointGroupKey)
+        assertEquals("quic", result.profile.transportMode)
         assertNull(result.profile.multiHop)
         assertEquals("", result.profile.nokinvToken)
         assertNull(EndpointOptionsStateReducer.applyEndpointOptions(state, direct, emptyList()))
@@ -58,7 +59,7 @@ class EndpointOptionsRefreshPolicyTest {
             endpointGroupKey = "lv-2|tls|nokinv||100")
         val pl = lv.copy(code = "pl-nv", locationCode = "pl-1", host = "pl.example", priority = 200,
             port = 11443, endpointGroupKey = "pl-1|tls|nokinv||200")
-        assertEquals("tls|nokinv|", EndpointGroupPolicy.groupKey(lv))
+        assertEquals("tls|nokinv|quic", EndpointGroupPolicy.groupKey(lv))
         assertEquals(EndpointGroupPolicy.groupKey(lv), EndpointGroupPolicy.groupKey(pl))
         val selected = com.noki.vpn.data.AdvancedSettings(protocol = VpnProtocol.NOKINV,
             endpointSelectionMode = EndpointSelectionMode.MANUAL, manualEndpointGroupKey = lv.endpointGroupKey)
@@ -87,21 +88,22 @@ class EndpointOptionsRefreshPolicyTest {
     }
 
     @Test
-    fun `manual picker exposes both NokiNV carriers and rejects retired or unknown transports`() {
+    fun `manual picker exposes QUIC NokiNV and supported direct transports`() {
         val reality = VpnEndpointOption(code = "vision", locationCode = "lv", host = "example.test",
             proxyType = "vless", security = "reality", transport = "tcp")
         val stream = reality.copy(code = "stream", transport = "xhttp", transportMode = "stream-up")
         val tls = reality.copy(code = "tls", security = "tls")
         val hy2 = reality.copy(code = "hy2", proxyType = "hysteria", security = "tls", transport = "hysteria")
         val nokinv = tls.copy(code = "nokinv", proxyType = "nokinv", transport = "nokinv")
-        val rejected = listOf(reality, tls, stream.copy(code = "packet", transportMode = "packet-up"),
+        val rejected = listOf(tls, nokinv.copy(code = "nv-tcp", transportMode = "tcp"),
+            stream.copy(code = "packet", transportMode = "packet-up"),
             reality.copy(code = "upgrade", transport = "httpupgrade"),
             reality.copy(code = "unknown", transport = "new-protocol"),
             stream.copy(code = "missing-mode", transportMode = ""))
 
-        assertEquals(setOf("nokinv", "stream", "hy2"),
-            EndpointGroupPolicy.manualOptions(listOf(nokinv, stream, hy2) + rejected).map { it.code }.toSet())
-        assertEquals(4, EndpointGroupPolicy.manualOptions(listOf(nokinv, stream, hy2) + rejected).size)
+        assertEquals(setOf("nokinv", "stream", "hy2", "vision"),
+            EndpointGroupPolicy.manualOptions(listOf(nokinv, stream, hy2, reality) + rejected).map { it.code }.toSet())
+        assertEquals(4, EndpointGroupPolicy.manualOptions(listOf(nokinv, stream, hy2, reality) + rejected).size)
     }
 
     @Test

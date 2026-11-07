@@ -344,20 +344,6 @@ data class BackendRuWireGuardConfig(
     val allowedIps: List<String>,
 )
 
-data class BackendYoutubeAccess(
-    val mode: String,
-    val status: String,
-    val grantId: String,
-    val generation: Int,
-    val expiresAtEpochMillis: Long,
-    val revokeToken: String,
-    val publicKeyId: String? = null,
-    val wireguard: BackendRuWireGuardConfig? = null,
-    val endpoint: BackendEndpointCandidate? = null,
-    val vpnSecret: String? = null,
-    val vpnUsername: String? = null,
-)
-
 sealed interface BackendRuWireGuardSession {
     val identity: BackendRuWireGuardIdentity
 

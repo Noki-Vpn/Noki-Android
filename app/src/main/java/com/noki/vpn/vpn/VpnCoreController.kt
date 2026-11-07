@@ -154,6 +154,10 @@ internal class VpnCoreController(
         override fun usePlatformAutoDetectInterfaceControl() = true
         override fun autoDetectInterfaceControl(fd: Int) = bindSocket(fd)
         override fun bindInterfaceControl(fd: Int, interfaceName: String) {
+            if (interfaceName == "lo") {
+                check(protectSocket?.invoke(fd) != false) { "vpn_socket_protect_failed" }
+                return
+            }
             check(connectivity.getLinkProperties(physicalNetwork())?.interfaceName == interfaceName) {
                 "underlay_interface_changed"
             }

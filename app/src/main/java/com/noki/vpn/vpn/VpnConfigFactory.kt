@@ -13,7 +13,7 @@ import org.json.JSONObject
 object VpnConfigFactory {
     private const val DNS_TAG = "noki-node-dns"
     private const val BOOTSTRAP_TAG = "bootstrap"
-    private const val YOUTUBE_TAG = "youtube-ru"
+    private const val YOUTUBE_TAG = "youtube-local"
     private const val YOUTUBE_RULE = "geosite:youtube"
 
     // The same V2Fly private set used by the server compiler, including CGNAT/reserved ranges.
@@ -93,17 +93,15 @@ object VpnConfigFactory {
                 ?: throw IllegalArgumentException("geosite_youtube_empty")
             rules.put(JSONObject().put("type", "logical").put("mode", "and").put("rules", JSONArray()
                 .put(JSONObject(youtube.toString())).put(JSONObject().put("ip_version", 6))).put("action", "reject"))
-            rules.put(networkDomainMatch(youtube, "udp", 443).put("action", "reject"))
+            rules.put(networkDomainMatch(youtube, "udp").put("action", "reject"))
+            rules.put(networkDomainMatch(youtube, "tcp").put("action", "resolve")
+                .put("server", DNS_TAG).put("strategy", "ipv4_only"))
             val tcp = networkDomainMatch(youtube, "tcp")
             rules.put(if (youtubeConnection == null) tcp.put("action", "reject") else route(tcp, YOUTUBE_TAG))
             dnsRules.put(JSONObject(youtube.toString()).put("server", DNS_TAG))
-            when (youtubeConnection) {
-                is YoutubeConnectionConfig.WireGuard -> endpoints.put(wireGuardEndpoint(
-                    youtubeConnection.wireguard, youtubeConnection.privateKey, YOUTUBE_TAG, keepalive = 0))
-                is YoutubeConnectionConfig.SelectedTransport -> outbounds.put(
-                    proxyOutbound(youtubeConnection.profile).put("tag", YOUTUBE_TAG))
-                null -> Unit
-            }
+            youtubeConnection?.let { local -> outbounds.put(JSONObject().put("type", "socks").put("tag", YOUTUBE_TAG)
+                .put("server", "127.0.0.1").put("server_port", local.port).put("version", "5")
+                .put("network", "tcp").put("bind_interface", "lo")) }
         }
         // DNS follows the same exclusions as data; a failed underlay lookup never falls back to node DNS.
         // YouTube's explicit protected DNS rule stays ahead of overlapping user exclusions.
@@ -144,10 +142,9 @@ object VpnConfigFactory {
     private fun bootstrapServer(): JSONObject = JSONObject().put("type", "local").put("tag", BOOTSTRAP_TAG)
     private fun resolver(server: String): JSONObject = JSONObject().put("server", server).put("strategy", "ipv4_only")
 
-    private fun networkDomainMatch(domains: JSONObject, network: String, port: Int? = null): JSONObject =
+    private fun networkDomainMatch(domains: JSONObject, network: String): JSONObject =
         JSONObject().put("type", "logical").put("mode", "and").put("rules", JSONArray()
-            .put(JSONObject(domains.toString())).put(JSONObject().put("network", JSONArray().put(network))
-                .apply { port?.let { put("port", JSONArray().put(it)) } }))
+            .put(JSONObject(domains.toString())).put(JSONObject().put("network", JSONArray().put(network))))
 
     private fun domainMatch(selectors: List<String>, geosite: Map<String, JSONObject>): JSONObject? {
         val fields = linkedMapOf<String, LinkedHashSet<String>>()

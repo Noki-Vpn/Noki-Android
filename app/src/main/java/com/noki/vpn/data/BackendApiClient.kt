@@ -540,45 +540,6 @@ class BackendApiClient(
         }
     }
 
-    suspend fun createYoutubeAccess(
-        token: String, requestId: String, deviceId: String, deviceKey: String?,
-        deviceNonce: String, deviceSignature: String, publicKeyId: String,
-        primaryEndpointCode: String?,
-    ): BackendYoutubeAccess = BackendYoutubeAccessJsonParser.parse(postJson("/vpn/youtube-access", JSONObject()
-        .put("request_id", canonicalRuUuid(requestId)).put("device_id", canonicalRuUuid(deviceId))
-        .put("device_key", deviceKey).put("device_nonce", deviceNonce).put("device_signature", deviceSignature)
-        .put("public_key_id", canonicalRuUuid(publicKeyId)).put("primary_endpoint_code", primaryEndpointCode),
-        token, deviceId, deviceKey))
-
-    suspend fun pollYoutubeAccess(token: String, deviceId: String, deviceKey: String?, grantId: String): BackendYoutubeAccess =
-        youtubeAccessRequest(token, deviceId, deviceKey, grantId)
-
-    suspend fun renewYoutubeAccess(token: String, deviceId: String, deviceKey: String?,
-                                   grant: BackendYoutubeAccess): BackendYoutubeAccess =
-        youtubeAccessRequest(token, deviceId, deviceKey, grant.grantId, grant.generation)
-
-    private suspend fun youtubeAccessRequest(token: String, deviceId: String, deviceKey: String?,
-                                            grantId: String, generation: Int? = null): BackendYoutubeAccess = DeviceIdentity.withChallengeTransaction {
-        withContext(Dispatchers.IO) {
-            val proof = createDeviceChallenge(token, canonicalRuUuid(deviceId))
-            val suffix = if (generation == null) "" else "/renew"
-            val url = jsonApi.apiUrl("/vpn/youtube-access/${canonicalRuUuid(grantId)}$suffix").toHttpUrl().newBuilder()
-                .addQueryParameter("device_id", canonicalRuUuid(deviceId)).build()
-            val builder = Request.Builder().url(url).header("Authorization", "Bearer $token")
-                .currentDeviceHeaders(deviceId, deviceKey)
-                .header("X-Device-Nonce", proof.nonce)
-                .header("X-Device-Signature", challengeSigner(proof.nonce))
-            if (generation == null) builder.get() else builder.post(JSONObject().put("generation", generation).toString().toRequestBody(JSON_MEDIA_TYPE))
-            BackendYoutubeAccessJsonParser.parse(execute(builder.build()))
-        }
-    }
-
-    suspend fun revokeYoutubeAccess(grantId: String, revokeToken: String): Unit = withContext(Dispatchers.IO) {
-        execute(Request.Builder().url(jsonApi.apiUrl("/vpn/youtube-access/${canonicalRuUuid(grantId)}"))
-            .header("X-Youtube-Revoke-Token", revokeToken).delete().build())
-        Unit
-    }
-
     suspend fun registerRuWireGuardKey(
         token: String,
         deviceId: String,
