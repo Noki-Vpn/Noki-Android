@@ -271,6 +271,17 @@ data class BackendVpnSession(
     val nokinvCredentialGeneration: Int = 0,
 )
 
+data class BackendYoutubeAccess(
+    val mode: String,
+    val status: String,
+    val grantId: String,
+    val generation: Int,
+    val expiresAtEpochMillis: Long,
+    val revokeToken: String,
+    val publicKeyId: String? = null,
+    val wireguard: BackendRuWireGuardConfig? = null,
+)
+
 data class BackendMultiHopSession(
     val selection: MultiHopSettings,
     val entryNodeId: String,

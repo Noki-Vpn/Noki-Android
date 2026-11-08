@@ -123,8 +123,11 @@ class AppVpnService : VpnService() {
     private val runtimeDomainReapplyOwner = Any()
     private val temporaryLeaseExpiryOwner = Any()
     private val transientRecoveryOwner = Any()
+    private val youtubeRoutingOwner = Any()
     private val youtubeConnection by lazy {
-        YoutubeConnection.android(applicationContext, backgroundScope, underlyingNetworkSource, ::protect)
+        YoutubeConnection(applicationContext, backgroundScope, SettingsRepository(this),
+            api = { underlyingNetworkSource.currentSnapshot()?.network?.let(backendApi::onNetwork) ?: backendApi },
+            onConfigurationChanged = ::scheduleYoutubeRoutingUpdate)
     }
     @Volatile private var transientRecoveryAttempt = 0
     @Volatile private var pendingNetworkRecovery: (() -> Unit)? = null
@@ -368,6 +371,7 @@ class AppVpnService : VpnService() {
         }
         // Deferred core cleanup may overlap a new service instance in the same process.
         youtubeConnection.stop()
+        delayedTaskScheduler.cancel(youtubeRoutingOwner)
         super.onDestroy()
     }
 
@@ -1624,6 +1628,31 @@ class AppVpnService : VpnService() {
         }
     }
 
+    private fun scheduleYoutubeRoutingUpdate() {
+        delayedTaskScheduler.schedule(youtubeRoutingOwner, 500L) {
+            if (currentState == VpnConnectionState.CONNECTING || connectionOrchestrator.transitionSnapshot().active) {
+                scheduleYoutubeRoutingUpdate()
+                return@schedule
+            }
+            val activeTunnel = tunnel ?: return@schedule
+            val settings = activeSettings ?: return@schedule
+            if (currentState != VpnConnectionState.CONNECTED || currentRuntimeMode != VpnRuntimeMode.ACCOUNT) return@schedule
+            val repository = SettingsRepository(this)
+            try {
+                buildActiveRuntimeConfig(settings)
+            } catch (error: Exception) {
+                youtubeConnection.rejectConfiguration()
+                repository.recordAppLog("vpn", level = "error", message = "youtube_config_invalid",
+                    errorType = error.javaClass.simpleName)
+                return@schedule
+            }
+            launchConnectionTransition(repository) { generationId ->
+                replaceCoreOnExistingTunnel(repository, settings, settings, settings, activeEndpointNetworkKind,
+                    activeTunnel, generationId, runtimeSettingsOnly = true, youtubeUpdate = true)
+            }
+        }
+    }
+
     private suspend fun replaceCoreOnExistingTunnel(
         repository: SettingsRepository,
         settings: StoredSettings,
@@ -1637,6 +1666,7 @@ class AppVpnService : VpnService() {
         rollbackOnFailure: Boolean = true,
         underlay: UnderlyingNetworkSnapshot? = null,
         canActivate: () -> Boolean = { true },
+        youtubeUpdate: Boolean = false,
     ): Boolean = connectionOrchestrator.withLifecycleLock {
         if (!canActivate() || !connectionOrchestrator.isCurrent(generationId) ||
             tunnel !== activeTunnel ||
@@ -1699,7 +1729,7 @@ class AppVpnService : VpnService() {
                 connectedSettings,
                 preparationBaseline = preparationBaseline,
                 generationId = generationId,
-                resetConnectedAt = true,
+                resetConnectedAt = !youtubeUpdate,
                 readinessLatencyMs = nextReadiness,
                 persistSettings = !runtimeSettingsOnly,
                 activationKind = ConnectedActivationKind.EXISTING_TUN,
@@ -1708,27 +1738,30 @@ class AppVpnService : VpnService() {
             return@withLifecycleLock true
         }
 
-        val failedHealth = repository.recordEndpointResult(
-            endpointCode = settings.profile.endpointCode,
-            success = false,
-            networkKind = activeEndpointNetworkKind,
-        )
-        recordEndpointHealthEvent(
-            repository = repository,
-            settings = settings,
-            endpointCode = settings.profile.endpointCode,
-            networkKind = activeEndpointNetworkKind,
-            eventType = EndpointHealthEventType.CONNECT_FAIL,
-            success = false,
-            slow = false,
-            health = failedHealth,
-        )
+        if (youtubeUpdate) youtubeConnection.rejectConfiguration()
+        if (!youtubeUpdate) {
+            val failedHealth = repository.recordEndpointResult(
+                endpointCode = settings.profile.endpointCode,
+                success = false,
+                networkKind = activeEndpointNetworkKind,
+            )
+            recordEndpointHealthEvent(
+                repository = repository,
+                settings = settings,
+                endpointCode = settings.profile.endpointCode,
+                networkKind = activeEndpointNetworkKind,
+                eventType = EndpointHealthEventType.CONNECT_FAIL,
+                success = false,
+                slow = false,
+                health = failedHealth,
+            )
+        }
 
         val desiredSelectionChanged = VpnSettingsTransactionPolicy.candidateBecameStale(
             previousSettings, repository.load(),
         )
         if (!canActivate() || !rollbackOnFailure || desiredSelectionChanged ||
-            (previousSettings.advancedSettings.multiHop.enabled && !VpnProfileValidator.isUsable(previousSettings))) {
+            (!youtubeUpdate && previousSettings.advancedSettings.multiHop.enabled && !VpnProfileValidator.isUsable(previousSettings))) {
             broadcastState(
                 VpnConnectionState.FAILED,
                 checkNotNull(VpnReadinessPolicy.failureReason(nextStarted, nextReadiness)).code,
@@ -1743,7 +1776,7 @@ class AppVpnService : VpnService() {
         activeEndpointNetworkKind = previousNetworkKind
         notificationServerLabel = runtimeServerLabel(previousSettings)
         connectionOrchestrator.stopCore()
-        val previousConfig = buildActiveRuntimeConfig(previousSettings)
+        val previousConfig = buildActiveRuntimeConfig(previousSettings, includeYoutube = !youtubeUpdate)
         val previousStarted = connectionOrchestrator.startCore(previousConfig)
         var previousReadinessCompleted = false
         val previousReadiness = try {
@@ -1810,8 +1843,8 @@ class AppVpnService : VpnService() {
         false
     }
 
-    private fun buildActiveRuntimeConfig(settings: StoredSettings): String {
-        val youtube = youtubeConnection.configFor(settings)
+    private fun buildActiveRuntimeConfig(settings: StoredSettings, includeYoutube: Boolean = true): String {
+        val youtube = if (includeYoutube) youtubeConnection.configFor(settings) else null
         val session = ruSession ?: return VpnConfigFactory.build(settings.profile, settings.advancedSettings,
             GeositeAsset.readSnapshot(applicationContext), youtubeConnection = youtube)
         val key = WireGuardKeyStore.android(applicationContext).getOrCreate()
@@ -2444,6 +2477,7 @@ class AppVpnService : VpnService() {
         retryBlockedTunnel: Boolean = true,
     ) {
         youtubeConnection.stop()
+        delayedTaskScheduler.cancel(youtubeRoutingOwner)
         ruSession?.let { stageRuWireGuardRevoke(repository, it) }
         ruSession = null
         cancelDelayedVpnCallbacks()
@@ -2544,6 +2578,7 @@ class AppVpnService : VpnService() {
         reason: String,
     ) {
         youtubeConnection.stop()
+        delayedTaskScheduler.cancel(youtubeRoutingOwner)
         ruSession?.let { stageRuWireGuardRevoke(repository, it) }
         ruSession = null
         val isLockdown = tunnel != null && shouldBlockDirectTraffic()
@@ -2677,6 +2712,7 @@ class AppVpnService : VpnService() {
         reason: String? = null,
     ) {
         youtubeConnection.stop()
+        delayedTaskScheduler.cancel(youtubeRoutingOwner)
         ruSession?.let { stageRuWireGuardRevoke(repository, it) }
         ruSession = null
         cancelDelayedVpnCallbacks()

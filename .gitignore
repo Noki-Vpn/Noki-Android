@@ -33,7 +33,6 @@ Thumbs.db
 *.sqlite*
 *.zip
 !app/libs/libbox.SOURCE.zip
-!app/libs/byedpi.SOURCE.zip
 !third_party/geosite/SOURCE.zip
 *.tar
 *.gz

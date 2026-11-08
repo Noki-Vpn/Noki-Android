@@ -1666,81 +1666,66 @@ class AppVpnServiceCommandTest {
     }
 
     @Test
-    fun serviceDestroyStopsLocalYoutubeBeforeDeferredCoreCleanup() = runBlocking {
+    fun serviceDestroyCancelsYoutubeAdmissionBeforeDeferredCoreCleanup() = runBlocking {
         val fixture = Fixture(this)
         val scope = CoroutineScope(SupervisorJob() + Dispatchers.Unconfined)
-        var stops = 0
-        var endpointsClosed = 0
-        val local = YoutubeConnection(scope, { "wifi" }, {
-            YoutubeEndpoint(30_001, java.io.FileDescriptor()) { endpointsClosed++ }
-        }, { _, _ -> object : YoutubeRuntime {
-            override suspend fun start() = Unit
-            override suspend fun awaitExit(): Int = awaitCancellation()
-            override fun stop() { stops++ }
-        } }, { throw AssertionError(it) })
-        val defaults = DefaultStoredSettingsFactory.create()
-        local.start(defaults.copy(isAuthenticated = true, backendDeviceId = "device",
-            userProfile = defaults.userProfile.copy(selectedPlanTier = "plus"),
-            advancedSettings = defaults.advancedSettings.copy(youtubeNoAdsEnabled = true)))
-        fixture.set("youtubeConnection\$delegate", lazyOf(local))
+        val remote = YoutubeConnection(fixture.service, scope, SettingsRepository(fixture.service),
+            { error("unexpected admission") }, {})
+        val admission = scope.launch { awaitCancellation() }
+        YoutubeConnection::class.java.getDeclaredField("job").apply { isAccessible = true }.set(remote, admission)
+        fixture.set("youtubeConnection\$delegate", lazyOf(remote))
         fixture.set("screenStateMonitor", VpnScreenStateMonitor(fixture.service) { })
         fixture.set("destroyCleanupScope", scope)
         fixture.orchestrator.lifecycleMutex.lock()
         try {
             fixture.service.onDestroy()
-
-            assertTrue(stops > 0)
-            assertEquals(1, endpointsClosed)
+            assertTrue(admission.isCancelled)
             assertNotNull("core cleanup is still waiting for its lifecycle lock", fixture.orchestrator.currentTunnel())
         } finally {
             fixture.orchestrator.lifecycleMutex.unlock()
             scope.coroutineContext[Job]!!.children.forEach { it.join() }
-            local.stop()
             scope.cancel()
         }
     }
 
     @Test
-    fun localYoutubeFailurePreservesTheRunningPrimaryCoreAndTunnel() = runBlocking {
+    fun youtubeExpiryAndRuntimeFailureKeepThePrimaryAndExistingTunnelWhileBlockingOnlyYoutube() = runBlocking {
         val fixture = Fixture(this, probeFallback = true, workingEndpoint = "tcp1")
         val scope = CoroutineScope(SupervisorJob() + Dispatchers.Unconfined)
-        val exit = kotlinx.coroutines.CompletableDeferred<Int>()
-        val failures = mutableListOf<Throwable>()
-        val local = YoutubeConnection(scope, { "wifi" }, {
-            YoutubeEndpoint(30_001, java.io.FileDescriptor()) { }
-        }, { _, _ -> object : YoutubeRuntime {
-            override suspend fun start() = Unit
-            override suspend fun awaitExit(): Int = exit.await()
-            override fun stop() = Unit
-        } }, { failures += it })
-        fixture.set("youtubeConnection\$delegate", lazyOf(local))
+        val remote = YoutubeConnection(fixture.service, scope, SettingsRepository(fixture.service),
+            { error("unexpected admission") }, {})
+        fixture.set("youtubeConnection\$delegate", lazyOf(remote))
         val defaults = DefaultStoredSettingsFactory.create()
         fixture.saveSettings(defaults.copy(isAuthenticated = true, backendDeviceId = "device", backendDeviceKey = "key",
             userProfile = defaults.userProfile.copy(selectedPlanTier = "plus"),
             advancedSettings = defaults.advancedSettings.copy(ruRelayEnabled = false, youtubeNoAdsEnabled = true)))
-        fixture.onConnected = { _, settings -> local.start(settings) }
         try {
             fixture.startPrepared()
             val tunnel = fixture.orchestrator.currentTunnel()
-            val starts = fixture.startedConfigs.size
-            val stops = fixture.runtimeStops
-            val endpoint = local.configFor(checkNotNull(fixture.orchestrator.currentSettings()))
-            assertTrue(fixture.startedConfigs.last().getJSONArray("outbounds").toString().contains("youtube-local"))
-
-            exit.complete(4)
-            shadowOf(Looper.getMainLooper()).idle()
-
-            assertTrue(failures.any { it.message == "youtube_byedpi_exited_4" })
-            assertEquals(endpoint, local.configFor(checkNotNull(fixture.orchestrator.currentSettings())))
-            assertEquals(starts, fixture.startedConfigs.size)
-            assertEquals(stops, fixture.runtimeStops)
+            val settings = checkNotNull(fixture.orchestrator.currentSettings())
+            YoutubeConnection::class.java.getDeclaredField("target").apply { isAccessible = true }
+                .set(remote, YoutubeConnection.targetFor(settings))
+            val publish = YoutubeConnection::class.java.getDeclaredMethod("publish", Long::class.javaPrimitiveType,
+                YoutubeConnectionConfig::class.java, Long::class.javaPrimitiveType).apply { isAccessible = true }
+            val grant = com.noki.vpn.data.BackendYoutubeAccessJsonParser.parse(com.noki.vpn.data.youtubeAccessFixture())
+            publish.invoke(remote, 0L, YoutubeConnection.runtimeConfig(grant, checkNotNull(grant.publicKeyId), ByteArray(32) { 8 }), grant.expiresAtEpochMillis)
+            assertTrue(fixture.replaceConnected(rollbackOnFailure = true, youtubeUpdate = true))
+            assertTrue(fixture.startedConfigs.last().getJSONArray("endpoints").toString().contains("youtube-ru"))
+            publish.invoke(remote, 0L, null, 0L)
+            assertTrue(fixture.replaceConnected(rollbackOnFailure = true, youtubeUpdate = true))
+            assertFalse(fixture.startedConfigs.last().has("endpoints"))
+            assertTrue(fixture.startedConfigs.last().getJSONObject("route").getJSONArray("rules").toString().contains("reject"))
+            publish.invoke(remote, 0L, YoutubeConnection.runtimeConfig(grant, checkNotNull(grant.publicKeyId), ByteArray(32) { 8 }), grant.expiresAtEpochMillis)
+            fixture.rejectYoutubeStarts = true
+            assertTrue(fixture.replaceConnected(rollbackOnFailure = true, youtubeUpdate = true))
+            assertNull(remote.configFor(settings))
+            assertFalse(fixture.startedConfigs.last().has("endpoints"))
+            assertEquals(settings.profile, fixture.orchestrator.currentSettings()!!.profile)
             assertEquals(tunnel, fixture.orchestrator.currentTunnel())
+            assertEquals(1, fixture.tunnelsCreated)
             assertEquals(VpnConnectionState.CONNECTED, fixture.orchestrator.currentState())
             assertTrue(fixture.runtimeRunning)
-        } finally {
-            local.stop()
-            scope.cancel()
-        }
+        } finally { remote.stop(); scope.cancel() }
     }
 
     @Test
@@ -2047,6 +2032,7 @@ class AppVpnServiceCommandTest {
         var runtimeRebinds = 0
         var runtimeWakes = 0
         var runtimeRebindSucceeds = true
+        var rejectYoutubeStarts = false
         var tunnelsCreated = 0
         var onProbe: () -> Unit = {}
         var onConnected: (RuntimeOwner, StoredSettings) -> Unit = { _, _ -> }
@@ -2082,8 +2068,8 @@ class AppVpnServiceCommandTest {
                     val outbound = parsed.getJSONArray("outbounds").getJSONObject(0)
                     startedEndpoints += if (outbound.getString("type") == "hysteria2") "hy2"
                         else outbound.getString("server").substringBefore('.')
-                    runtimeRunning = true
-                    return true
+                    runtimeRunning = !rejectYoutubeStarts || parsed.optJSONArray("endpoints")?.toString()?.contains("youtube-ru") != true
+                    return runtimeRunning
                 }
                 override fun stop() { runtimeStops++; runtimeRunning = false }
                 override fun wake() { runtimeWakes++ }
@@ -2350,7 +2336,7 @@ class AppVpnServiceCommandTest {
             ) }
         }
 
-        suspend fun replaceConnected(rollbackOnFailure: Boolean = false,
+        suspend fun replaceConnected(rollbackOnFailure: Boolean = false, youtubeUpdate: Boolean = false,
                                      canActivate: () -> Boolean = { true }): Boolean = suspendCoroutineUninterceptedOrReturn { continuation ->
             val settings = checkNotNull(orchestrator.currentSettings())
             try {
@@ -2358,7 +2344,7 @@ class AppVpnServiceCommandTest {
                     .apply { isAccessible = true }.invoke(
                         service, SettingsRepository(service), settings, settings, settings,
                         EndpointRankingPolicy.NetworkKind.CELLULAR, orchestrator.currentTunnel(),
-                        orchestrator.beginTransition(), null, false, rollbackOnFailure, null, canActivate, continuation,
+                        orchestrator.beginTransition(), null, false, rollbackOnFailure, null, canActivate, youtubeUpdate, continuation,
                     )
             } catch (error: java.lang.reflect.InvocationTargetException) {
                 throw error.targetException

@@ -551,6 +551,30 @@ internal object BackendTemporaryVpnResponseParser {
     }
 }
 
+internal object BackendYoutubeAccessJsonParser {
+    fun parse(json: JSONObject, now: Instant = Instant.now()): BackendYoutubeAccess {
+        require(json.opt("version") == 1 && json.getString("mode") == "wireguard") { "youtube_access_version_invalid" }
+        val status = json.getString("status")
+        require(status in setOf("pending", "ready", "blocked")) { "youtube_access_state_invalid" }
+        val grantId = canonicalRuUuid(json.getString("grant_id"))
+        val generation = json.opt("generation") as? Int
+        require(generation != null && generation > 0) { "youtube_access_generation_invalid" }
+        val expires = Instant.parse(json.getString("expires_at")).toEpochMilli()
+        require(status == "blocked" || expires > now.toEpochMilli()) { "youtube_access_expired" }
+        val revokeToken = json.getString("revoke_token")
+        require(revokeToken.isNotBlank()) { "youtube_access_revoke_invalid" }
+        val ready = status == "ready"
+        require((!json.isNull("wireguard")) == ready && (!json.isNull("public_key_id")) == ready &&
+            json.isNull("endpoint") && json.isNull("vpn_secret") &&
+            json.isNull("nokinv_device_id") && json.isNull("nokinv_credential_generation")) {
+            "youtube_access_payload_invalid"
+        }
+        return BackendYoutubeAccess("wireguard", status, grantId, generation, expires, revokeToken,
+            if (ready) canonicalRuUuid(json.getString("public_key_id")) else null,
+            if (ready) RuWireGuardSessionJsonParser.parseConfig(json.getJSONObject("wireguard")) else null)
+    }
+}
+
 internal object BackendVpnSessionJsonParser {
     fun parse(json: JSONObject): BackendVpnSession {
         val routeMode = json.optString("route_mode", "direct")

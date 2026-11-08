@@ -146,7 +146,7 @@ class VpnConfigFactoryTest {
                 val settings = AdvancedSettings(protocol = com.noki.vpn.data.VpnProtocol.NOKINV,
                     gamingModeEnabled = gaming, endpointSelectionMode = selection, youtubeNoAdsEnabled = youtube,
                     bypassDomains = listOf("geosite:youtube", "domain:local.example"))
-                val youtubeConnection = if (youtube) youtubeLocal() else null
+                val youtubeConnection = if (youtube) youtubeRemote() else null
                 val config = JSONObject(VpnConfigFactory.build(profile.copy(transportMode = transport),
                     settings, geosite, youtubeConnection))
                 val standard = JSONObject(VpnConfigFactory.build(profile(), settings.copy(
@@ -382,7 +382,7 @@ class VpnConfigFactoryTest {
     fun youtubeProtectedDnsPrecedesAnOverlappingDirectDnsException() {
         val config = JSONObject(VpnConfigFactory.build(profile(), AdvancedSettings(
             youtubeNoAdsEnabled = true, bypassDomains = listOf("geosite:youtube"),
-        ), geosite, youtubeLocal()))
+        ), geosite, youtubeRemote()))
         val dnsRules = config.getJSONObject("dns").getJSONArray("rules")
         val protected = dnsRules.getJSONObject(0)
         assertEquals("noki-node-dns", protected.getString("server"))
@@ -394,13 +394,13 @@ class VpnConfigFactoryTest {
         assertEquals(protectedMatch.toString(), directMatch.toString())
         val ordinary = JSONObject(VpnConfigFactory.build(profile(), AdvancedSettings(
             youtubeNoAdsEnabled = true, bypassDomains = listOf("domain:local.example"),
-        ), geosite, youtubeLocal()))
+        ), geosite, youtubeRemote()))
         val ordinaryDns = ordinary.getJSONObject("dns").getJSONArray("rules")
         assertFalse(ordinaryDns.getJSONObject(0).toString().contains("local.example"))
         assertEquals("bootstrap", (0 until ordinaryDns.length()).map(ordinaryDns::getJSONObject)
             .single { it.toString().contains("local.example") }.getString("server"))
         val traffic = rules(ordinary)
-        assertTrue(traffic.indexOfFirst { it.optString("outbound") == "youtube-local" } <
+        assertTrue(traffic.indexOfFirst { it.optString("outbound") == "youtube-ru" } <
             traffic.indexOfFirst { it.toString().contains("local.example") })
         assertEquals("direct", traffic.single { it.toString().contains("local.example") }.getString("outbound"))
     }
@@ -517,18 +517,29 @@ class VpnConfigFactoryTest {
     }
 
     @Test
+    fun youtubeRemainsWireGuardWhenThePrimaryUsesGamingMode() {
+        val primary = VlessProfile(proxyType = "nokinv", transport = "nokinv", security = "tls",
+            host = "main.example", port = "443", serverName = "main.example",
+            nokinvToken = "A".repeat(43), nokinvCredentialGeneration = 7)
+        val config = JSONObject(VpnConfigFactory.build(primary, AdvancedSettings(
+            youtubeNoAdsEnabled = true, gamingModeEnabled = true), geosite, youtubeRemote()))
+        assertEquals("gaming", config.getJSONArray("outbounds").getJSONObject(0).getString("mode"))
+        assertYoutubeTransport(config)
+    }
+
+    @Test
     fun youtubeConnectsDirectlyForEveryPrimaryProtocolAndOverridesUserBypass() {
         val settings = AdvancedSettings(youtubeNoAdsEnabled = true, bypassDomains = listOf("geosite:youtube"))
         val naive = profile().copy(proxyType = "naive", transport = "naive", security = "tls", flow = "",
             publicKey = "", shortId = "", vpnUsername = "main-user")
         for (primary in primaryProfiles() + naive) {
-            val config = JSONObject(VpnConfigFactory.build(primary, settings, geosite, youtubeLocal()))
+            val config = JSONObject(VpnConfigFactory.build(primary, settings, geosite, youtubeRemote()))
             assertYoutubeRoute(config)
             assertYoutubeTransport(config)
-            assertFalse(config.has("endpoints"))
+            assertEquals(1, config.getJSONArray("endpoints").length())
             assertEquals(primary.host, config.getJSONArray("outbounds").getJSONObject(0).getString("server"))
             val routeRules = rules(config)
-            assertTrue(routeRules.indexOfFirst { it.optString("outbound") == "youtube-local" } <
+            assertTrue(routeRules.indexOfFirst { it.optString("outbound") == "youtube-ru" } <
                 routeRules.indexOfFirst { it.optString("outbound") == "direct" && it.toString().contains("googlevideo.com") })
         }
     }
@@ -540,7 +551,7 @@ class VpnConfigFactoryTest {
         val settings = AdvancedSettings(youtubeNoAdsEnabled = true, multiHop = route.selection)
         for (candidate in session.endpointCandidates) {
             val profile = EndpointSelector.profileFromCandidate(session, candidate)
-            val config = JSONObject(VpnConfigFactory.build(profile, settings, geosite, youtubeLocal()))
+            val config = JSONObject(VpnConfigFactory.build(profile, settings, geosite, youtubeRemote()))
             assertYoutubeRoute(config)
             assertYoutubeTransport(config)
             assertEquals(route.entryIp, config.getJSONArray("outbounds").getJSONObject(0).getString("server"))
@@ -555,10 +566,10 @@ class VpnConfigFactoryTest {
         for (multiHop in listOf(false, true)) {
             val settings = AdvancedSettings(ruRelayEnabled = true, youtubeNoAdsEnabled = true,
                 multiHop = MultiHopSettings(enabled = multiHop))
-            val config = JSONObject(VpnConfigFactory.buildWireGuard(wg, ByteArray(32) { 1 }, settings, geosite, youtubeLocal()))
+            val config = JSONObject(VpnConfigFactory.buildWireGuard(wg, ByteArray(32) { 1 }, settings, geosite, youtubeRemote()))
             assertYoutubeRoute(config)
             assertYoutubeTransport(config)
-            assertEquals(1, config.getJSONArray("endpoints").length())
+            assertEquals(2, config.getJSONArray("endpoints").length())
             assertEquals("proxy", config.getJSONArray("endpoints").getJSONObject(0).getString("tag"))
             assertEquals(wg.endpoint.substringBefore(':'), config.getJSONArray("endpoints").getJSONObject(0)
                 .getJSONArray("peers").getJSONObject(0).getString("address"))
@@ -567,14 +578,14 @@ class VpnConfigFactoryTest {
 
     @Test
     fun youtubeDisabledDoesNotInstallTheSecondaryRouteAndMissingProfileCannotFallThrough() {
-        val disabled = JSONObject(VpnConfigFactory.build(profile(), AdvancedSettings(), geosite, youtubeLocal()))
-        assertFalse(disabled.toString().contains("youtube-local"))
-        assertFalse(disabled.toString().contains("youtube-exit.example"))
+        val disabled = JSONObject(VpnConfigFactory.build(profile(), AdvancedSettings(), geosite, youtubeRemote()))
+        assertFalse(disabled.toString().contains("youtube-ru"))
+        assertFalse(disabled.toString().contains("203.0.113.5"))
         val missing = JSONObject(VpnConfigFactory.build(profile(), AdvancedSettings(youtubeNoAdsEnabled = true), geosite))
         val youtubeRules = rules(missing).filter { it.toString().contains("googlevideo.com") }
-        assertEquals(4, youtubeRules.size)
+        assertEquals(3, youtubeRules.size)
         assertEquals(3, youtubeRules.count { it.getString("action") == "reject" && !it.has("outbound") })
-        assertEquals("ipv4_only", youtubeRules.single { it.getString("action") == "resolve" }.getString("strategy"))
+        assertFalse(youtubeRules.any { it.getString("action") == "resolve" })
         assertEquals("proxy", missing.getJSONObject("route").getString("final"))
     }
 
@@ -587,11 +598,8 @@ class VpnConfigFactoryTest {
         val udp = rejects.single { it.getJSONArray("rules").getJSONObject(1).has("network") }
         assertEquals("[\"udp\"]", udp.getJSONArray("rules").getJSONObject(1).getJSONArray("network").toString())
         assertFalse(udp.getJSONArray("rules").getJSONObject(1).has("port"))
-        val resolve = rules(config).single { it.optString("action") == "resolve" }
-        assertEquals("ipv4_only", resolve.getString("strategy"))
-        assertEquals("noki-node-dns", resolve.getString("server"))
-        assertFalse(resolve.toString().contains("google.com"))
-        assertEquals("[\"tcp\"]", rules(config).single { it.optString("outbound") == "youtube-local" }
+        assertFalse(rules(config).any { it.optString("action") == "resolve" })
+        assertEquals("[\"tcp\"]", rules(config).single { it.optString("outbound") == "youtube-ru" }
             .getJSONArray("rules").getJSONObject(1).getJSONArray("network").toString())
         val dns = config.getJSONObject("dns").getJSONArray("rules").getJSONObject(0)
         assertTrue(dns.toString().contains("googlevideo.com"))
@@ -599,21 +607,26 @@ class VpnConfigFactoryTest {
     }
 
     private fun assertYoutubeTransport(config: JSONObject) {
-        val outbounds = config.getJSONArray("outbounds")
-        val youtube = (0 until outbounds.length()).map(outbounds::getJSONObject).single { it.getString("tag") == "youtube-local" }
-        assertEquals("socks", youtube.getString("type"))
-        assertEquals("127.0.0.1", youtube.getString("server"))
-        assertEquals(30_001, youtube.getInt("server_port"))
-        assertEquals("5", youtube.getString("version"))
-        assertEquals("tcp", youtube.getString("network"))
-        assertEquals("lo", youtube.getString("bind_interface"))
-        assertFalse(youtube.has("uuid"))
-        assertFalse(youtube.has("tls"))
-        assertFalse(youtube.has("transport"))
+        val endpoints = config.getJSONArray("endpoints")
+        val youtube = (0 until endpoints.length()).map(endpoints::getJSONObject).single { it.getString("tag") == "youtube-ru" }
+        assertEquals("wireguard", youtube.getString("type"))
+        assertFalse(youtube.getBoolean("system"))
+        assertEquals("[\"10.241.0.2/32\"]", youtube.getJSONArray("address").toString())
+        assertEquals(1280, youtube.getInt("mtu"))
+        assertEquals(java.util.Base64.getEncoder().encodeToString(ByteArray(32) { 8 }), youtube.getString("private_key"))
+        val peer = youtube.getJSONArray("peers").getJSONObject(0)
+        assertEquals("203.0.113.5", peer.getString("address"))
+        assertEquals(51820, peer.getInt("port"))
+        assertEquals(0, peer.getInt("persistent_keepalive_interval"))
+        assertEquals("[\"0.0.0.0/0\"]", peer.getJSONArray("allowed_ips").toString())
+        assertFalse(youtube.has("bind_interface"))
         assertFalse(youtube.has("detour"))
+        assertFalse(config.getJSONArray("outbounds").toString().contains("youtube-ru"))
     }
 
-    private fun youtubeLocal() = YoutubeConnectionConfig(30_001)
+    private fun youtubeRemote() = YoutubeConnectionConfig(BackendRuWireGuardConfig("203.0.113.5:51820",
+        java.util.Base64.getEncoder().encodeToString(ByteArray(32) { 7 }), "10.241.0.2/32",
+        listOf("1.1.1.1"), 1280, listOf("0.0.0.0/0")), ByteArray(32) { 8 })
 
     private fun primaryProfiles() = listOf(
         profile().copy(transport = "xhttp", transportMode = "stream-up", port = "443", flow = "", path = "/stream", requestHost = "front.example"),
