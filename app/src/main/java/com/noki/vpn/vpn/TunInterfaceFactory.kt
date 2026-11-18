@@ -9,6 +9,7 @@ import com.noki.vpn.data.BackendRuWireGuardConfig
 
 internal interface TunHandle : AutoCloseable {
     val fd: Int
+    val routingRules: AppVpnRoutingRules.Ready? get() = null
 }
 
 internal interface TunInterfaceFactory {
@@ -44,7 +45,7 @@ internal class AndroidTunInterfaceFactory(
             .setMtu(config.mtu)
             .addAddress(config.address.substringBefore('/'), 32)
             .addRoute("0.0.0.0", 0)
-        // The RU IPIP path carries IPv4 only. Leave IPv6 blocked by Android;
+        // RU WireGuard carries IPv4 only. Leave IPv6 blocked by Android;
         // advertising it makes browsers reach a dead path after TCP accept.
         // A public DNS address here can trigger a browser's same-provider DoH upgrade.
         builder.addDnsServer(VpnTunnelPolicy.DNS_SERVER)
@@ -70,13 +71,16 @@ internal class AndroidTunInterfaceFactory(
             throw TunInterfaceConfigurationException(routingRules.failureReason)
         }
         check(routingRules is AppVpnRoutingRules.Ready)
+        if (routingRules.requiresOwnerCheck && Build.VERSION.SDK_INT < Build.VERSION_CODES.Q) {
+            throw TunInterfaceConfigurationException(AppVpnRoutingPolicy.OWNER_CHECK_UNAVAILABLE_REASON)
+        }
         try {
             routingRules.allowedPackages.forEach(builder::addAllowedApplication)
             routingRules.disallowedPackages.forEach(builder::addDisallowedApplication)
         } catch (error: PackageManager.NameNotFoundException) {
             throw TunInterfaceConfigurationException("rules_error", error)
         }
-        return builder.establish()?.let(::ParcelFileDescriptorTunHandle)
+        return builder.establish()?.let { ParcelFileDescriptorTunHandle(it, routingRules) }
     }
 
     private fun VpnService.Builder.applyDefaultUnderlyingNetworkMetadata(
@@ -92,6 +96,7 @@ internal class AndroidTunInterfaceFactory(
 
 private class ParcelFileDescriptorTunHandle(
     private val descriptor: ParcelFileDescriptor,
+    override val routingRules: AppVpnRoutingRules.Ready,
 ) : TunHandle {
     override val fd: Int
         get() = descriptor.fd

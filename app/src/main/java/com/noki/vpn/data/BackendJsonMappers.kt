@@ -124,9 +124,11 @@ internal fun JSONObject.toBackendLocation(): BackendLocation =
                     capacityMbps = node.optBackendInt("capacity_mbps"),
                     loadPercent = node.optBackendInt("load_percent"),
                     metricsAt = node.optBackendString("metrics_at"),
-                    weight = node.optInt("weight", 1),
+                    weight = node.selectionWeight(allowLegacyBandwidth = true),
                     multiHopEntryAvailable = node.optBoolean("multihop_entry_available", false),
                     multiHopExitAvailable = node.optBoolean("multihop_exit_available", false),
+                    probeHost = node.optBackendString("probe_host"),
+                    probeIp = node.optBackendString("probe_ip"),
                 )
             }
         }.orEmpty(),
@@ -215,6 +217,29 @@ internal fun RuWireGuardSessionRequest.toBackendJson(): JSONObject {
 internal fun canonicalRuUuid(raw: String): String = runCatching { UUID.fromString(raw).toString() }
     .getOrElse { throw IllegalArgumentException("ru_wireguard_uuid_invalid", it) }
     .also { require(it == raw.lowercase(Locale.ROOT)) { "ru_wireguard_uuid_invalid" } }
+
+internal fun JSONObject.selectionWeight(allowLegacyBandwidth: Boolean = false): Int {
+    if (!has("selection_weight") || isNull("selection_weight")) {
+        return if (allowLegacyBandwidth) optInt("weight", 1) else 1
+    }
+    val weight = opt("selection_weight")
+    require(weight is Int && weight in 1..1000) { "node_selection_weight_invalid" }
+    return weight
+}
+
+internal fun List<RuRelayRttSample>.toNodeRttJson(): JSONArray {
+    require(size <= 64 && all { it.rttMs in 1..3000 } && map { canonicalRuUuid(it.nodeId) }.distinct().size == size) {
+        "node_rtt_samples_invalid"
+    }
+    return JSONArray().apply { forEach { put(JSONObject().put("node_id", it.nodeId).put("rtt_ms", it.rttMs)) } }
+}
+
+internal fun JSONObject.toSelectionNode(): VpnServer = VpnServer(
+    id = canonicalRuUuid(getString("id")), name = getString("name"), countryCode = getString("country_code"),
+    locationCode = "", host = optBackendString("probe_host").orEmpty(), probePort = optBackendInt("probe_port")?.takeIf { it in 1..65535 },
+    isOnline = true, weight = selectionWeight(), metricsAt = optBackendString("metrics_at"),
+    probeHost = optBackendString("probe_host"), probeIp = optBackendString("probe_ip"),
+).also { require(it.name.isNotBlank() && it.countryCode.isNotBlank()) { "node_selection_candidate_invalid" } }
 
 internal object RuWireGuardSessionJsonParser {
     fun parse(
@@ -316,11 +341,7 @@ internal object RuWireGuardSessionJsonParser {
         require(address.endsWith("/32") && isIpv4(address.removeSuffix("/32"))) {
             "ru_wireguard_address_invalid"
         }
-        val key = json.getString("server_public_key")
-        val decoded = key.decodeBase64()?.toByteArray()
-        require(decoded != null && decoded.size == 32 && decoded.any { it != 0.toByte() }) {
-            "ru_wireguard_key_invalid"
-        }
+        val key = parseKey(json)
         val dnsArray = json.getJSONArray("dns")
         val dns = (0 until dnsArray.length()).map { dnsArray.getString(it) }
         require(dns.size in 1..4 && dns.all(::isIpv4)) { "ru_wireguard_dns_invalid" }
@@ -328,8 +349,39 @@ internal object RuWireGuardSessionJsonParser {
         val allowed = (0 until allowedArray.length()).map { allowedArray.getString(it) }
         require(allowed == listOf("0.0.0.0/0")) { "ru_wireguard_allowed_ips_invalid" }
         val mtu = json.getInt("mtu")
+        require(!json.has("relay")) { "ru_wireguard_endpoint_invalid" }
         require(mtu in 1280..1500) { "ru_wireguard_mtu_invalid" }
         return BackendRuWireGuardConfig(endpoint, key, address, dns, mtu, allowed)
+    }
+
+    internal fun parseEntryCredential(json: JSONObject, expectedRelay: String? = null): RuEntryCredential {
+        val relay = canonicalRuUuid(json.getString("relay_node_id"))
+        require(expectedRelay == null || relay == expectedRelay) { "ru_entry_relay_mismatch" }
+        val wireguard = parseConfig(json.getJSONObject("wireguard"))
+        val gateway = json.getString("route_gateway")
+        val address = wireguard.address.removeSuffix("/32")
+        require(address.startsWith("10.240.") && address != gateway && gateway == address.substringBeforeLast('.') + ".1") {
+            "ru_entry_gateway_invalid"
+        }
+        return RuEntryCredential(relay, wireguard, gateway, Instant.parse(json.getString("expires_at")).toEpochMilli())
+    }
+
+    internal fun encodeEntryCredential(credential: RuEntryCredential): JSONObject {
+        val wireguard = credential.wireguard
+        return JSONObject().put("relay_node_id", credential.relayNodeId).put("route_gateway", credential.routeGateway)
+            .put("expires_at", Instant.ofEpochMilli(credential.expiresAtEpochMillis).toString())
+            .put("wireguard", JSONObject().put("endpoint", wireguard.endpoint).put("server_public_key", wireguard.serverPublicKey)
+                .put("address", wireguard.address).put("dns", JSONArray(wireguard.dns)).put("mtu", wireguard.mtu)
+                .put("allowed_ips", JSONArray(wireguard.allowedIps)))
+    }
+
+    private fun parseKey(json: JSONObject): String {
+        val key = json.getString("server_public_key")
+        val decoded = key.decodeBase64()?.toByteArray()
+        require(decoded != null && decoded.size == 32 && decoded.any { it != 0.toByte() }) {
+            "ru_wireguard_key_invalid"
+        }
+        return key
     }
 
     private fun isIpv4(raw: String): Boolean {
@@ -617,6 +669,10 @@ internal object BackendVpnSessionJsonParser {
         endpointCandidates = candidates,
         connectIp = json.optBackendString("connect_ip"),
         multiHop = multiHop,
+        entryRoute = json.opt("entry_route_v1") == true,
+        entryRouteExpiresAt = json.optBackendString("expires_at")?.let { value ->
+            runCatching { Instant.parse(value).toEpochMilli() }.getOrNull()
+        },
         nokinvToken = json.optBackendString("nokinv_token").orEmpty(),
         nokinvCredentialGeneration = json.optInt("nokinv_credential_generation", 0),
     )

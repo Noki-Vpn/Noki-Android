@@ -21,7 +21,7 @@ import com.noki.vpn.data.AppDiagnosticLogPolicy
 import com.noki.vpn.data.BackendApiClient
 import com.noki.vpn.data.BackendException
 import com.noki.vpn.data.BackendRetryPolicy
-import com.noki.vpn.data.BackendRuWireGuardSession
+import com.noki.vpn.data.RuEntryCredential
 import com.noki.vpn.data.BackendVpnSession
 import com.noki.vpn.data.DeviceTrafficMonitor
 import com.noki.vpn.data.DeviceIdentity
@@ -37,7 +37,6 @@ import com.noki.vpn.data.EndpointSelector
 import com.noki.vpn.data.EndpointSelectionMode
 import com.noki.vpn.data.EndpointTransportPolicy
 import com.noki.vpn.data.PendingLogoutRevocationWorker
-import com.noki.vpn.data.PendingRuWireGuardRevoke
 import com.noki.vpn.data.hasSameAuthSessionAs
 import com.noki.vpn.data.SettingsRepository
 import com.noki.vpn.data.StoredSettings
@@ -69,8 +68,10 @@ import java.util.Locale
 import java.time.Instant
 import java.util.UUID
 import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicLong
 
 class AppVpnService : VpnService() {
+    private val publicStateOwner = synchronized(publicStateLock) { publicStateSequence.incrementAndGet() }
     private lateinit var underlyingNetworkSource: AndroidUnderlyingNetworkSource
     private val backendApi = BackendApiClient()
     private val notificationHandler = Handler(Looper.getMainLooper())
@@ -95,9 +96,8 @@ class AppVpnService : VpnService() {
     private lateinit var settingsStore: AtomicStoredSettingsStore
     private lateinit var connectionOrchestrator: VpnConnectionOrchestrator
     private lateinit var ruTunFactory: AndroidTunInterfaceFactory
-    @Volatile private var ruSession: BackendRuWireGuardSession.Ready? = null
-    private val ruStatusInFlight = AtomicBoolean(false)
-    @Volatile private var lastRuStatusCheckElapsedMs = 0L
+    private data class ActiveRuRoute(val credential: RuEntryCredential, val exitNodeId: String)
+    @Volatile private var ruRoute: ActiveRuRoute? = null
     private var backgroundJob: Job = SupervisorJob()
     private var backgroundScope: CoroutineScope = CoroutineScope(backgroundJob + Dispatchers.IO)
     private val destroyCleanupJob: Job = SupervisorJob()
@@ -152,7 +152,7 @@ class AppVpnService : VpnService() {
     }
     override fun onCreate() {
         super.onCreate()
-        updateLiveRuntimeState(VpnConnectionState.DISCONNECTED, null)
+        publishIfCurrentService { updateLiveRuntimeState(VpnConnectionState.DISCONNECTED, null) }
         delayedTaskScheduler = HandlerDelayedTaskScheduler(notificationHandler)
         notificationFactory = VpnNotificationFactory(this, NOTIFICATION_ID)
         warmupController = VpnWarmupController(
@@ -279,7 +279,7 @@ class AppVpnService : VpnService() {
             onStop = { owner -> stopConnectedSidecars(owner) },
         )
         val controller = VpnCoreController(applicationContext, protectSocket = { protect(it) }) {
-            startService(Intent(this, AppVpnService::class.java).setAction(ACTION_STOP))
+            publishIfCurrentService { startService(Intent(this, AppVpnService::class.java).setAction(ACTION_STOP)) }
         }
         connectionOrchestrator = VpnConnectionOrchestrator(
             core = controller,
@@ -298,6 +298,7 @@ class AppVpnService : VpnService() {
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+        if (!isCurrentService()) return START_NOT_STICKY
         val temporaryStopDecision = VpnServiceStartCommandPolicy.temporaryStopDecision(
             action = intent?.action,
             runtimeMode = currentRuntimeMode,
@@ -490,7 +491,7 @@ class AppVpnService : VpnService() {
     private fun announceConnecting(runtimeMode: VpnRuntimeMode = currentRuntimeMode) {
         currentRuntimeMode = runtimeMode
         broadcastState(VpnConnectionState.CONNECTING)
-        startForeground(
+        startOwnedForeground(
             NOTIFICATION_ID,
             createNotification(
                 title = "Подключение",
@@ -507,8 +508,9 @@ class AppVpnService : VpnService() {
     ) {
         if (!connectionOrchestrator.isCurrent(generationId) || !currentCoroutineContext().isActive) return
         if (repository.load().advancedSettings.ruRelayEnabled) {
+            val underlay = observeRuConnectingUnderlay(generationId) ?: return
             GeositeAsset.ensureBundledFallback(applicationContext)
-            performRuWireGuardStart(repository, generationId)
+            performRuWireGuardStart(repository, generationId, underlay)
             return
         }
         val prepared = coroutineScope {
@@ -554,40 +556,49 @@ class AppVpnService : VpnService() {
     private suspend fun performRuWireGuardStart(
         repository: SettingsRepository,
         generationId: Long,
+        underlay: UnderlyingNetworkSnapshot,
+        excludedPairs: Set<Pair<String, String>> = emptySet(),
+        deadline: Long = SystemClock.elapsedRealtime() + 30_000L,
     ) {
+        if (!isCurrentService() || !connectionOrchestrator.isCurrent(generationId)) return
         var baseline = repository.load()
         val prepared = try {
-            val physicalNetwork = underlyingNetworkSource.currentObservation().candidate?.network
+            val physicalNetwork = underlay.network
                 ?: throw IllegalStateException("underlay_unavailable")
             val preparationApi = backendApi.onNetwork(physicalNetwork)
             val coordinator = RuWireGuardConnectionCoordinator(
-                applicationContext, repository, preparationApi, physicalNetwork,
+                applicationContext, repository, preparationApi,
             )
-            try {
-                coordinator.prepare(baseline)
-            } catch (expired: BackendException) {
-                if (expired.statusCode != 401) throw expired
-                val refreshed = AuthTokenRefresher(repository, preparationApi,
-                    onRevocationPending = { PendingLogoutRevocationWorker.enqueue(applicationContext) },
-                ).refreshStoredTokens()
-                check(refreshed != null) { "auth_required" }
-                baseline = repository.load()
-                coordinator.prepare(baseline)
-            }
+            withTimeoutOrNull((deadline - SystemClock.elapsedRealtime()).coerceAtLeast(1L)) {
+                try {
+                    coordinator.prepare(baseline, excludedPairs)
+                } catch (expired: BackendException) {
+                    if (expired.statusCode != 401) throw expired
+                    val refreshed = AuthTokenRefresher(repository, preparationApi,
+                        onRevocationPending = { PendingLogoutRevocationWorker.enqueue(applicationContext) },
+                    ).refreshStoredTokens()
+                    check(refreshed != null) { "auth_required" }
+                    baseline = repository.load()
+                    coordinator.prepare(baseline, excludedPairs)
+                }
+            } ?: error("ru_wireguard_session_timeout")
         } catch (cancelled: CancellationException) {
             runCatching {
                 if (repository.recoverProvisionalRuWireGuardRevokes(
-                    activeSessionId = ruSession?.identity?.sessionId, preparationActive = false,
+                    activeSessionId = null, preparationActive = false,
                 )) PendingRuWireGuardRevokeWorker.enqueue(applicationContext)
             }
             throw cancelled
         } catch (error: Throwable) {
             if (connectionOrchestrator.isCurrent(generationId)) {
-                failStart(repository, error.message ?: "ru_wireguard_prepare_failed", error)
+                if (underlyingNetworkSource.currentSnapshot()?.signature != underlay.signature) {
+                    restartRuAfterUnderlayChange(generationId)
+                } else failStart(repository, error.message ?: "ru_wireguard_prepare_failed", error)
             }
             return
         }
         var activated = false
+        var retryPair: Pair<String, String>? = null
         try {
             if (!connectionOrchestrator.isCurrent(generationId)) return
             connectionOrchestrator.withLifecycleLock {
@@ -597,9 +608,12 @@ class AppVpnService : VpnService() {
                     return@withLifecycleLock
                 }
                 val settings = normalizeInstalledPackages(repository.load())
-                val underlay = underlyingNetworkSource.currentSnapshot()
+                if (underlyingNetworkSource.currentSnapshot()?.signature != underlay.signature) {
+                    restartRuAfterUnderlayChange(generationId)
+                    return@withLifecycleLock
+                }
                 val established = try {
-                    ruTunFactory.establishWireGuard(settings, underlay, prepared.session.wireguard)
+                    ruTunFactory.establishWireGuard(settings, underlay, prepared.credential.wireguard)
                 } catch (error: TunInterfaceConfigurationException) {
                     failStart(repository, error.reason, error)
                     return@withLifecycleLock
@@ -614,17 +628,24 @@ class AppVpnService : VpnService() {
                 if (previous !== established) previous?.close()
                 connectionOrchestrator.updateUnderlay(underlay)
                 try {
-                    val config = VpnConfigFactory.buildWireGuard(prepared.session.wireguard,
+                    val config = VpnConfigFactory.buildWireGuard(prepared.credential.wireguard,
                         prepared.privateKey, settings.advancedSettings, GeositeAsset.readSnapshot(applicationContext),
-                        youtubeConnection = youtubeConnection.configFor(settings))
+                        youtubeConnection = youtubeConnection.configFor(settings), entryRouteGateway = prepared.credential.routeGateway)
                     if (!connectionOrchestrator.startCore(config)) {
                         failStart(repository, "ru_wireguard_runtime_start_failed")
                         return@withLifecycleLock
                     }
-                    val readiness = measureRuntimeReadiness(recovery = false)
+                    val readiness = selectEntryRoute(repository, prepared.exitNode.id, prepared.enrolled, deadline)
                     if (!connectionOrchestrator.isCurrent(generationId)) return@withLifecycleLock
-                    if (!VpnReadinessPolicy.accept(readiness)) {
-                        failStart(repository, "ru_wireguard_exit_probe_failed")
+                    if (underlyingNetworkSource.currentSnapshot()?.signature != underlay.signature) {
+                        restartRuAfterUnderlayChange(generationId)
+                        return@withLifecycleLock
+                    }
+                    if (!VpnReadinessPolicy.accept(readiness) ||
+                        prepared.credential.expiresAtEpochMillis <= System.currentTimeMillis()) {
+                        if (excludedPairs.size < 2 && SystemClock.elapsedRealtime() < deadline) {
+                            retryPair = prepared.credential.relayNodeId to prepared.exitNode.id
+                        } else failStart(repository, "entry_route_not_confirmed")
                         return@withLifecycleLock
                     }
                     val commit = commitSettingsTransaction(
@@ -641,10 +662,10 @@ class AppVpnService : VpnService() {
                     }
                     val connectedSettings = commit.runtime
                     currentRuntimeMode = VpnRuntimeMode.ACCOUNT
-                    ruSession = prepared.session
-                    activeEndpointNetworkKind = underlay?.kind ?: EndpointRankingPolicy.NetworkKind.OTHER
+                    ruRoute = ActiveRuRoute(prepared.credential, prepared.exitNode.id)
+                    activeEndpointNetworkKind = underlay.kind
                     notificationServerLabel = VpnServiceLogContext.serverLabel(
-                        prepared.exitNode.countryCode, prepared.exitNode.name,
+                        prepared.exitNode.countryCode, "RU → ${prepared.exitNode.name}",
                         connectedSettings.personalizationSettings.language,
                     )
                     connectedAtMillis = System.currentTimeMillis()
@@ -658,19 +679,13 @@ class AppVpnService : VpnService() {
                     activated = true
                     statsCoordinator.recordInitialLatency(connectedSettings, owner, readiness)
                     broadcastState(VpnConnectionState.CONNECTED)
-                    runCatching { repository.clearProvisionalRuWireGuardRevoke(
-                        prepared.session.identity.sessionId,
-                        checkNotNull(prepared.session.identity.revokeToken),
-                    ) }
-                        .onFailure { error -> repository.recordAppLog("vpn", level = "error",
-                            message = "ru_wireguard_handoff_clear_failed", errorType = error.javaClass.simpleName) }
-                    startForeground(NOTIFICATION_ID, createActiveNotification())
+                    startOwnedForeground(NOTIFICATION_ID, createActiveNotification())
                     repository.recordAppLog("vpn", message = "ru_wireguard_connected",
                         details = "exit_node=${prepared.exitNode.id}", connectionSuccess = true)
                 } finally {
                     if (!activated) {
                         connectionOrchestrator.stopCore()
-                        ruSession = null
+                        ruRoute = null
                         if (tunnel === established && !shouldBlockDirectTraffic()) {
                             tunnel = null
                             established.close()
@@ -679,11 +694,11 @@ class AppVpnService : VpnService() {
                 }
             }
         } finally {
-            try {
-                if (!activated) stageRuWireGuardRevoke(repository, prepared.session)
-            } finally {
-                prepared.privateKey.fill(0)
-            }
+            prepared.privateKey.fill(0)
+        }
+        // Failed candidates are fully stopped before preparing another pair; connected routes never reselect.
+        retryPair?.let { failed ->
+            performRuWireGuardStart(repository, generationId, underlay, excludedPairs + failed, deadline)
         }
     }
 
@@ -875,7 +890,7 @@ class AppVpnService : VpnService() {
             ) {
                 enterTruthfulLockdownFailure(repository, reason)
             } else {
-                startForeground(
+                startOwnedForeground(
                     NOTIFICATION_ID,
                     createNotification(
                         title = "VPN error",
@@ -913,14 +928,18 @@ class AppVpnService : VpnService() {
         candidate: StoredSettings,
         result: VpnSettingsTransactionPolicy.Result,
     ): VpnSettingsTransactionPolicy.RuntimeCommitOutcome {
-        val outcome = settingsStore.updateAndReturn { persisted ->
-            VpnSettingsTransactionPolicy.commitRuntimeCandidate(
-                previousRuntime = activeSettings ?: preparationBaseline,
-                preparationBaseline = preparationBaseline,
-                candidate = candidate,
-                result = result,
-                persisted = persisted,
-            ).let { it.persisted to it }
+        val previousRuntime = activeSettings ?: preparationBaseline
+        val outcome = synchronized(publicStateLock) {
+            if (!isCurrentService()) throw CancellationException("service_owner_changed")
+            settingsStore.updateAndReturn { persisted ->
+                VpnSettingsTransactionPolicy.commitRuntimeCandidate(
+                    previousRuntime = previousRuntime,
+                    preparationBaseline = preparationBaseline,
+                    candidate = candidate,
+                    result = result,
+                    persisted = persisted,
+                ).let { it.persisted to it }
+            }
         }
         activeSettings = outcome.runtime
         if (outcome.requiresFreshPrepare) scheduleFreshSelectionPrepare()
@@ -940,12 +959,15 @@ class AppVpnService : VpnService() {
         previousSettings: StoredSettings,
         candidateSettings: StoredSettings,
     ) {
-        val outcome = repository.updateAndReturn { persisted ->
-            VpnSettingsTransactionPolicy.rollbackRuntimeDomains(
-                previous = previousSettings,
-                candidate = candidateSettings,
-                persisted = persisted,
-            ).let { it.persisted to it }
+        val outcome = synchronized(publicStateLock) {
+            if (!isCurrentService()) return
+            repository.updateAndReturn { persisted ->
+                VpnSettingsTransactionPolicy.rollbackRuntimeDomains(
+                    previous = previousSettings,
+                    candidate = candidateSettings,
+                    persisted = persisted,
+                ).let { it.persisted to it }
+            }
         }
         activeSettings = outcome.runtime
         if (outcome.requiresReapply) scheduleRuntimeDomainReapply()
@@ -1156,9 +1178,8 @@ class AppVpnService : VpnService() {
             }
             var readinessCompleted = false
             val readinessLatencyMs = try {
-                (if (started) measureRuntimeReadiness(recovery = true,
-                    fastStartup = !attemptSettings.advancedSettings.ruRelayEnabled &&
-                        !attemptSettings.advancedSettings.multiHop.enabled) else null)
+                (if (started) confirmRuntimeReadiness(repository, attemptSettings,
+                    fastStartup = !attemptSettings.advancedSettings.multiHop.enabled) else null)
                     .also { readinessCompleted = true }
             } finally {
                 if (!readinessCompleted) {
@@ -1177,7 +1198,9 @@ class AppVpnService : VpnService() {
                 }
                 return@withLifecycleLock
             }
-            val failureReason = VpnReadinessPolicy.failureReason(started, readinessLatencyMs)?.code
+            val failureReason = if (started && attemptSettings.profile.entryRoute && readinessLatencyMs == null) {
+                "entry_route_not_confirmed"
+            } else VpnReadinessPolicy.failureReason(started, readinessLatencyMs)?.code
             if (failureReason == null) {
                 finishTunnelConnected(
                     repository = repository,
@@ -1293,7 +1316,7 @@ class AppVpnService : VpnService() {
             restartTemporaryVpn()
             return
         }
-        if (ruSession != null || settingsStore.load().advancedSettings.ruRelayEnabled) {
+        if (ruRoute != null || settingsStore.load().advancedSettings.ruRelayEnabled) {
             restartVpn(VpnPreparationStrategy.FreshOnly)
             return
         }
@@ -1684,7 +1707,7 @@ class AppVpnService : VpnService() {
         val nextConfig = buildActiveRuntimeConfig(settings)
 
         broadcastState(VpnConnectionState.CONNECTING, "runtime_replacement_in_progress")
-        startForeground(
+        startOwnedForeground(
             NOTIFICATION_ID,
             createNotification(
                 title = "VPN переподключается",
@@ -1696,7 +1719,7 @@ class AppVpnService : VpnService() {
         val nextStarted = connectionOrchestrator.startCore(nextConfig)
         var nextReadinessCompleted = false
         val nextReadiness = try {
-            (if (nextStarted) measureRuntimeReadiness(recovery = true) else null)
+            (if (nextStarted) confirmRuntimeReadiness(repository, settings) else null)
                 .also { nextReadinessCompleted = true }
         } finally {
             if (!nextReadinessCompleted) connectionOrchestrator.stopCore()
@@ -1711,11 +1734,14 @@ class AppVpnService : VpnService() {
                 return@withLifecycleLock false
             }
             val connectedSettings = if (runtimeSettingsOnly) {
-                val outcome = repository.updateAndReturn { persisted ->
-                    VpnSettingsTransactionPolicy.acceptRuntimeDomains(
-                        candidate = settings,
-                        persisted = persisted,
-                    ).let { it.persisted to it }
+                val outcome = synchronized(publicStateLock) {
+                    if (!isCurrentService()) throw CancellationException("service_owner_changed")
+                    repository.updateAndReturn { persisted ->
+                        VpnSettingsTransactionPolicy.acceptRuntimeDomains(
+                            candidate = settings,
+                            persisted = persisted,
+                        ).let { it.persisted to it }
+                    }
                 }
                 outcome.also {
                     activeSettings = outcome.runtime
@@ -1780,7 +1806,7 @@ class AppVpnService : VpnService() {
         val previousStarted = connectionOrchestrator.startCore(previousConfig)
         var previousReadinessCompleted = false
         val previousReadiness = try {
-            (if (previousStarted) measureRuntimeReadiness(recovery = true) else null)
+            (if (previousStarted) confirmRuntimeReadiness(repository, previousSettings) else null)
                 .also { previousReadinessCompleted = true }
         } finally {
             if (!previousReadinessCompleted) connectionOrchestrator.stopCore()
@@ -1816,7 +1842,7 @@ class AppVpnService : VpnService() {
             )
             statsCoordinator.recordInitialLatency(previousSettings, owner, previousReadiness)
             broadcastState(VpnConnectionState.CONNECTED)
-            startForeground(NOTIFICATION_ID, createActiveNotification())
+            startOwnedForeground(NOTIFICATION_ID, createActiveNotification())
             repository.recordAppLog(
                 category = "vpn",
                 level = "error",
@@ -1845,12 +1871,13 @@ class AppVpnService : VpnService() {
 
     private fun buildActiveRuntimeConfig(settings: StoredSettings, includeYoutube: Boolean = true): String {
         val youtube = if (includeYoutube) youtubeConnection.configFor(settings) else null
-        val session = ruSession ?: return VpnConfigFactory.build(settings.profile, settings.advancedSettings,
+        val session = ruRoute?.credential ?: return VpnConfigFactory.build(settings.profile, settings.advancedSettings,
             GeositeAsset.readSnapshot(applicationContext), youtubeConnection = youtube)
         val key = WireGuardKeyStore.android(applicationContext).getOrCreate()
         return try {
             VpnConfigFactory.buildWireGuard(session.wireguard, key.privateKey,
-                settings.advancedSettings, GeositeAsset.readSnapshot(applicationContext), youtubeConnection = youtube)
+                settings.advancedSettings, GeositeAsset.readSnapshot(applicationContext),
+                youtubeConnection = youtube, entryRouteGateway = session.routeGateway)
         } finally {
             key.privateKey.fill(0)
         }
@@ -1904,7 +1931,7 @@ class AppVpnService : VpnService() {
             statsCoordinator.recordInitialLatency(connectedSettings, owner, readinessLatencyMs)
         }
         broadcastState(VpnConnectionState.CONNECTED)
-        startForeground(NOTIFICATION_ID, createActiveNotification())
+        startOwnedForeground(NOTIFICATION_ID, createActiveNotification())
         if (runtimeMode == VpnRuntimeMode.ACCOUNT) {
             val health = repository.recordEndpointResult(
                 endpointCode = connectedSettings.profile.endpointCode,
@@ -2079,14 +2106,25 @@ class AppVpnService : VpnService() {
         settings: StoredSettings,
     ): CancelableTask? {
         val networkSignature = underlyingNetworkSource.currentSnapshot()?.signature ?: return null
-        if (currentState != VpnConnectionState.CONNECTED ||
-            tunnel == null ||
-            activeUnderlyingNetworkSignature != networkSignature ||
+        fun admitted(): Boolean {
+            val persisted = settingsStore.load()
+            return isCurrentService() && connectionOrchestrator.isCurrent(owner.generationId) &&
+                currentState == VpnConnectionState.CONNECTED &&
+                tunnel?.let(System::identityHashCode) == owner.tunnelIdentity &&
+                connectionOrchestrator.snapshot().owner?.coreId == owner.coreIdentity &&
+                !connectionOrchestrator.transitionSnapshot().active &&
+                activeSettings?.profile == settings.profile &&
+                persisted.profile == settings.profile &&
+                persisted.isAuthenticated == settings.isAuthenticated &&
+                persisted.userProfile.backendUserId == settings.userProfile.backendUserId &&
+                persisted.backendDeviceId == settings.backendDeviceId &&
+                persisted.backendDeviceKey == settings.backendDeviceKey &&
+                !VpnSettingsTransactionPolicy.candidateBecameStale(settings, persisted) &&
+                watchdogController.accepts(owner)
+        }
+        if (!admitted() || activeUnderlyingNetworkSignature != networkSignature ||
             lastUnderlyingAvailability == UnderlyingNetworkAvailability.None ||
-            lastUnderlyingAvailability == UnderlyingNetworkAvailability.Unvalidated ||
-            connectionOrchestrator.transitionSnapshot().active ||
-            watchdogController.currentSettings()?.profile?.endpointCode != settings.profile.endpointCode ||
-            !watchdogController.accepts(owner)
+            lastUnderlyingAvailability == UnderlyingNetworkAvailability.Unvalidated
         ) {
             return null
         }
@@ -2094,11 +2132,9 @@ class AppVpnService : VpnService() {
             val latencyMs = measureRuntimeReadiness(recovery = false, watchdog = true)
             if (!currentCoroutineContext().isActive) return@launch
             connectionOrchestrator.withLifecycleLock {
-                if (!currentCoroutineContext().isActive ||
-                    !connectionOrchestrator.isCurrent(owner.generationId) ||
-                    tunnel?.let(System::identityHashCode) != owner.tunnelIdentity ||
-                    !watchdogController.accepts(owner)
-                ) {
+                if (!currentCoroutineContext().isActive) return@withLifecycleLock
+                if (!admitted()) {
+                    watchdogController.stop(owner)
                     return@withLifecycleLock
                 }
                 // The physical network can change before its debounced callback arrives.
@@ -2120,7 +2156,10 @@ class AppVpnService : VpnService() {
                 }
                 when (val action = (outcome as? WatchdogProbeOutcome.Unhealthy)?.action ?: WatchdogAction.None) {
                     WatchdogAction.None -> Unit
-                    WatchdogAction.Refresh -> recoverConnectedVpn(settings)
+                    WatchdogAction.Refresh -> if (ruRoute != null ||
+                        !ConnectedWatchdogPolicy.automaticRecoveryAllowed(settings.userProfile.serverSelectionMode))
+                        restartVpn(VpnPreparationStrategy.FreshOnly)
+                        else recoverConnectedVpn(settings)
                     WatchdogAction.ReleaseOutsideLockdown -> {
                         connectionOrchestrator.invalidate()
                         connectionOrchestrator.stopCore()
@@ -2172,7 +2211,7 @@ class AppVpnService : VpnService() {
             connectionSuccess = false,
         )
         broadcastState(VpnConnectionState.FAILED, reason)
-        startForeground(
+        startOwnedForeground(
             NOTIFICATION_ID,
             createNotification(
                 title = "VPN недоступен",
@@ -2281,14 +2320,14 @@ class AppVpnService : VpnService() {
         if (!screenOn || currentState != VpnConnectionState.CONNECTED) return
         networkMonitor.refresh()
         checkConnectionAfterWake()
-        if (ruSession != null) backgroundScope.launch { checkRuAuthorization(force = true) }
+        if (ruRoute != null) backgroundScope.launch { checkRuAuthorization(force = false) }
     }
 
     private fun checkConnectionAfterWake() {
         val generation = connectionOrchestrator.currentGenerationId()
         val activeTunnel = tunnel ?: return
         val network = underlyingNetworkSource.currentSnapshot() ?: return
-        fun admitted(): Boolean = connectionOrchestrator.isCurrent(generation) && tunnel === activeTunnel &&
+        fun admitted(): Boolean = isCurrentService() && connectionOrchestrator.isCurrent(generation) && tunnel === activeTunnel &&
             currentState == VpnConnectionState.CONNECTED && !connectionOrchestrator.transitionSnapshot().active &&
             activeUnderlyingNetworkSignature == network.signature &&
             underlyingNetworkSource.currentSnapshot()?.signature == network.signature
@@ -2298,11 +2337,13 @@ class AppVpnService : VpnService() {
                 val resumed = connectionOrchestrator.withLifecycleLock {
                     if (!admitted()) false else {
                         connectionOrchestrator.wake()
-                        watchdogController.resetNetworkEvidence(preserveHealthyEvidence = true)
+                        if (currentRuntimeMode == VpnRuntimeMode.ACCOUNT) watchdogController.onWake()
+                        else watchdogController.resetNetworkEvidence(preserveHealthyEvidence = true)
                         true
                     }
                 }
                 if (!resumed) return@launch
+                if (currentRuntimeMode == VpnRuntimeMode.ACCOUNT) return@launch
                 val owner = watchdogController.currentOwner()
                 val latency = measureRuntimeReadiness(recovery = false, watchdog = true)
                 connectionOrchestrator.withLifecycleLock {
@@ -2322,7 +2363,44 @@ class AppVpnService : VpnService() {
         stopNetworkChangeMonitor()
         activeEndpointNetworkKind = initialKind
         lastUnderlyingAvailability = null
-        networkMonitor.start(::handleUnderlyingNetworkObservation)
+        val generation = connectionOrchestrator.currentGenerationId()
+        networkMonitor.start { observation ->
+            val deliver = Runnable {
+                if (isCurrentService() && (connectionOrchestrator.isCurrent(generation) ||
+                        currentState == VpnConnectionState.CONNECTED)) handleUnderlyingNetworkObservation(observation)
+            }
+            // refresh() also runs on startup IO; admission must share STOP's main-thread order.
+            if (Looper.myLooper() == notificationHandler.looper) deliver.run()
+            else notificationHandler.post(deliver)
+        }
+    }
+
+    private fun restartRuAfterUnderlayChange(generation: Long) {
+        val restart = Runnable {
+            if (isCurrentService() && connectionOrchestrator.isCurrent(generation) &&
+                currentState == VpnConnectionState.CONNECTING) restartVpn(VpnPreparationStrategy.FreshOnly)
+        }
+        if (Looper.myLooper() == notificationHandler.looper) restart.run()
+        else notificationHandler.post(restart)
+    }
+
+    private fun observeRuConnectingUnderlay(generation: Long): UnderlyingNetworkSnapshot? {
+        val selected = underlyingNetworkSource.currentSnapshot()
+        connectionOrchestrator.updateUnderlay(selected)
+        if (selected == null) {
+            val authSession = settingsStore.load()
+            pendingNetworkRecovery = {
+                if (isCurrentService() && connectionOrchestrator.isCurrent(generation) &&
+                    currentState == VpnConnectionState.CONNECTING && settingsStore.load().hasSameAuthSessionAs(authSession)) {
+                    pendingNetworkRecovery = null
+                    restartRuAfterUnderlayChange(generation)
+                }
+            }
+        }
+        startNetworkChangeMonitor(selected?.kind ?: activeEndpointNetworkKind)
+        // Read after registration too: a loss/replacement before onAvailable must not be missed.
+        networkMonitor.refresh()
+        return selected.takeIf { isCurrentService() && connectionOrchestrator.isCurrent(generation) }
     }
 
     private fun handleUnderlyingNetworkObservation(
@@ -2347,6 +2425,19 @@ class AppVpnService : VpnService() {
                 serverCountry = notificationServerLabel,
                 connectionSuccess = false,
             )
+        }
+        if (currentState == VpnConnectionState.CONNECTING && currentRuntimeMode == VpnRuntimeMode.ACCOUNT &&
+            settingsStore.load().advancedSettings.ruRelayEnabled) {
+            if (observation.availability == UnderlyingNetworkAvailability.Validated) {
+                val recovery = pendingNetworkRecovery
+                if (recovery != null) recovery()
+                else if (observation.candidate?.signature != activeUnderlyingNetworkSignature) {
+                    restartRuAfterUnderlayChange(connectionOrchestrator.currentGenerationId())
+                }
+            } else if (pendingNetworkRecovery == null) {
+                restartRuAfterUnderlayChange(connectionOrchestrator.currentGenerationId())
+            }
+            return
         }
         if (observation.availability != UnderlyingNetworkAvailability.Validated &&
             currentState == VpnConnectionState.CONNECTED
@@ -2416,10 +2507,10 @@ class AppVpnService : VpnService() {
     private fun rebindUnderlyingNetwork(next: UnderlyingNetworkSnapshot) {
         val generation = connectionOrchestrator.currentGenerationId()
         val activeTunnel = tunnel ?: return
-        val sessionId = ruSession?.identity?.sessionId
+        val activeRuRoute = ruRoute
         val mode = currentRuntimeMode
         fun admitted(): Boolean = connectionOrchestrator.isCurrent(generation) &&
-            tunnel === activeTunnel && currentRuntimeMode == mode && ruSession?.identity?.sessionId == sessionId &&
+            tunnel === activeTunnel && currentRuntimeMode == mode && ruRoute === activeRuRoute &&
             currentState == VpnConnectionState.CONNECTED &&
             underlyingNetworkSource.currentSnapshot()?.signature == next.signature
         backgroundScope.launch {
@@ -2431,9 +2522,18 @@ class AppVpnService : VpnService() {
                     connectionOrchestrator.updateUnderlay(next)
                     activeEndpointNetworkKind = next.kind
                     delayedTaskScheduler.cancel(transientRecoveryOwner)
-                    if (sessionId != null) backgroundScope.launch { checkRuAuthorization(force = true) }
+                    if (activeRuRoute != null) backgroundScope.launch { checkRuAuthorization(force = true) }
+                    else if (activeSettings?.profile?.entryRoute == true) backgroundScope.launch {
+                        connectionOrchestrator.withLifecycleLock {
+                            if (!admitted()) return@withLifecycleLock
+                            val repository = SettingsRepository(this@AppVpnService)
+                            if (selectEntryRoute(repository, activeSettings?.profile?.entryRouteExit()) == null && admitted()) {
+                                failStart(repository, "entry_route_not_confirmed", retryBlockedTunnel = false)
+                            }
+                        }
+                    }
                     SettingsRepository(this@AppVpnService).recordAppLog("vpn",
-                        message = if (sessionId != null) "ru_wireguard_underlay_rebound" else "underlay_rebound",
+                        message = if (activeRuRoute != null) "ru_wireguard_underlay_rebound" else "underlay_rebound",
                         details = "tun_preserved=true; runtime_preserved=true")
                 } else if (admitted()) {
                     // Retry only a failed bind; HTTP readiness is owned by the watchdog.
@@ -2454,6 +2554,7 @@ class AppVpnService : VpnService() {
         return when {
             error is BackendException && error.statusCode == 426 &&
                 error.message == "client_update_required" -> "client_update_required"
+            error.message == "entry_route_unavailable" -> "entry_route_unavailable"
             error is BackendException && error.message.contains("traffic", ignoreCase = true) -> "traffic_limit"
             error is BackendException && error.message.contains("device", ignoreCase = true) -> "device_limit"
             error.message?.contains("auth", ignoreCase = true) == true -> "auth_required"
@@ -2478,9 +2579,9 @@ class AppVpnService : VpnService() {
     ) {
         youtubeConnection.stop()
         delayedTaskScheduler.cancel(youtubeRoutingOwner)
-        ruSession?.let { stageRuWireGuardRevoke(repository, it) }
-        ruSession = null
+        ruRoute = null
         cancelDelayedVpnCallbacks()
+        stopNetworkChangeMonitor()
         recordDiagnostic(
             repository = repository,
             message = "connection_failed",
@@ -2519,7 +2620,7 @@ class AppVpnService : VpnService() {
         }
         connectionOrchestrator.releaseResourcesWhileOwned(VpnConnectionState.FAILED)
         connectedAtMillis = null
-        repository.clearVpnRuntimeState()
+        clearPublishedRuntimeState(repository)
         broadcastState(VpnConnectionState.FAILED, reason)
         if (currentRuntimeMode == VpnRuntimeMode.AUTH_TEMP) {
             destroyCleanupScope.launch {
@@ -2538,8 +2639,8 @@ class AppVpnService : VpnService() {
                     return@launch
                 }
                 notificationHandler.post {
-                    stopForeground(STOP_FOREGROUND_REMOVE)
-                    stopSelf()
+                    stopOwnedForeground(STOP_FOREGROUND_REMOVE)
+                    stopOwnedService()
                 }
                 if (pending != null) {
                     try {
@@ -2553,8 +2654,8 @@ class AppVpnService : VpnService() {
             }
             return
         }
-        stopForeground(STOP_FOREGROUND_REMOVE)
-        stopSelf()
+        stopOwnedForeground(STOP_FOREGROUND_REMOVE)
+        stopOwnedService()
     }
 
     private fun recordDiagnostic(
@@ -2579,8 +2680,7 @@ class AppVpnService : VpnService() {
     ) {
         youtubeConnection.stop()
         delayedTaskScheduler.cancel(youtubeRoutingOwner)
-        ruSession?.let { stageRuWireGuardRevoke(repository, it) }
-        ruSession = null
+        ruRoute = null
         val isLockdown = tunnel != null && shouldBlockDirectTraffic()
         when (ConnectedWatchdogPolicy.exhaustedRecoveryDecision(isLockdown)) {
             ConnectedWatchdogPolicy.ExhaustedRecoveryDecision.ReportLockdownBlockedAndRetry -> {
@@ -2601,7 +2701,7 @@ class AppVpnService : VpnService() {
                 connectionOrchestrator.releaseResourcesWhileOwned(VpnConnectionState.FAILED)
                 connectedAtMillis = null
                 broadcastState(VpnConnectionState.FAILED, reason)
-                startForeground(
+                startOwnedForeground(
                     NOTIFICATION_ID,
                     createNotification(
                         title = "VPN переподключается",
@@ -2627,7 +2727,7 @@ class AppVpnService : VpnService() {
             notificationHandler.post {
                 val transitionActive = connectionOrchestrator.transitionSnapshot().active
                 if (tunnel == null && !transitionActive) {
-                    stopSelfResult(startId)
+                    stopOwnedService(startId)
                 }
             }
         }
@@ -2664,7 +2764,7 @@ class AppVpnService : VpnService() {
                             )
                         }
                     } else {
-                        stopSelfResult(startId)
+                        stopOwnedService(startId)
                     }
                 }
             },
@@ -2688,22 +2788,6 @@ class AppVpnService : VpnService() {
         }
     }
 
-    private fun stageRuWireGuardRevoke(
-        repository: SettingsRepository,
-        session: BackendRuWireGuardSession.Ready,
-    ) {
-        try {
-            repository.stageRuWireGuardRevoke(PendingRuWireGuardRevoke(
-                sessionId = session.identity.sessionId,
-                revokeToken = checkNotNull(session.identity.revokeToken),
-            ))
-            PendingRuWireGuardRevokeWorker.enqueue(applicationContext)
-        } catch (error: Exception) {
-            repository.recordAppLog("vpn", level = "error", message = "ru_wireguard_revoke_stage_failed",
-                errorType = error.javaClass.simpleName)
-        }
-    }
-
     private fun releaseVpnResources(
         repository: SettingsRepository,
         finalState: VpnConnectionState?,
@@ -2713,19 +2797,19 @@ class AppVpnService : VpnService() {
     ) {
         youtubeConnection.stop()
         delayedTaskScheduler.cancel(youtubeRoutingOwner)
-        ruSession?.let { stageRuWireGuardRevoke(repository, it) }
-        ruSession = null
+        ruRoute = null
         cancelDelayedVpnCallbacks()
+        stopNetworkChangeMonitor()
         warmupController.clear()
         connectionOrchestrator.releaseResourcesWhileOwned(
             finalState,
             retainTunnel = finalState == null && shouldBlockDirectTraffic(),
         )
         connectedAtMillis = null
-        repository.clearVpnRuntimeState()
-        if (removeForeground) stopForeground(STOP_FOREGROUND_REMOVE)
+        clearPublishedRuntimeState(repository)
+        if (removeForeground) stopOwnedForeground(STOP_FOREGROUND_REMOVE)
         finalState?.let { broadcastState(it, reason) }
-        if (stopService) stopSelf()
+        if (stopService) stopOwnedService()
     }
 
     private fun manualRestartVpn() {
@@ -2753,7 +2837,7 @@ class AppVpnService : VpnService() {
         }
         val repository = SettingsRepository(this)
         repository.recordAppLog("vpn", message = "service_failed_closed_reconnect_start")
-        startForeground(
+        startOwnedForeground(
             NOTIFICATION_ID,
             createNotification(
                 title = "VPN reconnecting",
@@ -2805,7 +2889,7 @@ class AppVpnService : VpnService() {
         val started = connectionOrchestrator.startCore(config)
         var readinessCompleted = false
         val readinessLatencyMs = try {
-            (if (started) measureRuntimeReadiness(recovery = true) else null)
+            (if (started) confirmRuntimeReadiness(repository, settings) else null)
                 .also { readinessCompleted = true }
         } finally {
             if (!readinessCompleted) connectionOrchestrator.stopCore()
@@ -2934,11 +3018,11 @@ class AppVpnService : VpnService() {
     }
 
     private fun runtimeServerLabel(settings: StoredSettings): String =
-        if (ruSession != null) notificationServerLabel else VpnServiceLogContext.serverLabel(settings)
+        if (ruRoute != null) notificationServerLabel else VpnServiceLogContext.serverLabel(settings)
 
     private fun updateActiveNotification() {
         if (connectionOrchestrator.nokiNvCarrier() != liveRuntimeState().nokiNvCarrier) broadcastState(currentState)
-        notificationFactory.updateActive(notificationServerLabel)
+        publishIfCurrentService { notificationFactory.updateActive(notificationServerLabel) }
     }
 
     private fun startNotificationTicker() {
@@ -2952,7 +3036,7 @@ class AppVpnService : VpnService() {
     private fun pollAppNotifications(): CancelableTask? {
         if (currentState != VpnConnectionState.CONNECTED || currentRuntimeMode != VpnRuntimeMode.ACCOUNT) return null
         val job = backgroundScope.launch {
-            if (ruSession != null) checkRuAuthorization(force = false)
+            if (ruRoute != null) checkRuAuthorization(force = false)
             if (currentState != VpnConnectionState.CONNECTED) return@launch
             val repository = SettingsRepository(this@AppVpnService)
             val authApi = underlyingNetworkSource.currentSnapshot()?.network?.let(backendApi::onNetwork) ?: backendApi
@@ -3019,11 +3103,18 @@ class AppVpnService : VpnService() {
         val repository = SettingsRepository(this)
         youtubeConnection.start(settings)
         statsCoordinator.start(settings, owner)
-        DeviceTrafficMonitor.start(sessionId = checkNotNull(connectedAtMillis))
+        publishIfCurrentService {
+            DeviceTrafficMonitor.stop()
+            DeviceTrafficMonitor.start(sessionId = checkNotNull(connectedAtMillis))
+        }
         startNotificationTicker()
-        startNetworkChangeMonitor(activeEndpointNetworkKind)
-        if (ruSession != null) {
-            lastRuStatusCheckElapsedMs = 0L
+        if (settings.advancedSettings.ruRelayEnabled && networkMonitor.isStarted) networkMonitor.refresh()
+        else {
+            startNetworkChangeMonitor(activeEndpointNetworkKind)
+            if (settings.advancedSettings.ruRelayEnabled) networkMonitor.refresh()
+        }
+        if (ruRoute != null) {
+            startConnectedWatchdog(settings, owner)
             return
         }
         endpointHealthController.start(owner, settings)
@@ -3039,67 +3130,42 @@ class AppVpnService : VpnService() {
     }
 
     private suspend fun checkRuAuthorization(force: Boolean) {
-        val session = ruSession ?: return
+        val session = ruRoute ?: return
         if (currentState != VpnConnectionState.CONNECTED || currentRuntimeMode != VpnRuntimeMode.ACCOUNT || tunnel == null) return
-        val now = SystemClock.elapsedRealtime()
-        if (!force && lastRuStatusCheckElapsedMs != 0L && now - lastRuStatusCheckElapsedMs < RU_STATUS_INTERVAL_MS) return
-        if (!ruStatusInFlight.compareAndSet(false, true)) return
-        lastRuStatusCheckElapsedMs = now
+        val settings = SettingsRepository(this).load()
+        val baseline = activeSettings ?: return
+        if (session.credential.expiresAtEpochMillis <= System.currentTimeMillis() || !ruAuthorizationUnchanged(baseline, settings)) {
+            endRuAuthorization(session, "ru_wireguard_authorization_revoked")
+        } else if (force) {
+            connectionOrchestrator.withLifecycleLock {
+                if (ruRoute === session && selectEntryRoute(SettingsRepository(this), session.exitNodeId) == null) {
+                    failStart(SettingsRepository(this), "entry_route_not_confirmed", retryBlockedTunnel = false)
+                }
+            }
+        }
+    }
+
+    private suspend fun confirmRuntimeReadiness(repository: SettingsRepository, settings: StoredSettings, fastStartup: Boolean = false): Long? {
+        val exit = if (settings.advancedSettings.ruRelayEnabled) ruRoute?.exitNodeId else settings.profile.entryRouteExit()
+        if (settings.profile.entryRouteExpiresAt?.let { it <= System.currentTimeMillis() } == true) return null
+        return if (exit == null) measureRuntimeReadiness(recovery = true, fastStartup = fastStartup)
+            else selectEntryRoute(repository, exit)
+    }
+
+    private suspend fun selectEntryRoute(repository: SettingsRepository, exitNodeId: String?, enrollment: Boolean = false,
+                                        deadline: Long? = null): Long? = if (deadline != null) {
+        withTimeoutOrNull((deadline - SystemClock.elapsedRealtime()).coerceAtLeast(1L)) {
+            selectEntryRoute(repository, exitNodeId, enrollment)
+        }
+    } else readinessMutex.withLock {
+        if (exitNodeId == null) return@withLock null
+        val network = underlyingNetworkSource.currentSnapshot()?.signature ?: return@withLock null
+        val probe = connectionOrchestrator.prepareEntryRoute(exitNodeId, repository.nextEntryRouteGeneration(), enrollment)
         try {
-            val repository = SettingsRepository(this)
-            val settings = repository.load()
-            val baseline = activeSettings ?: return
-            if (!ruAuthorizationUnchanged(baseline, settings)) {
-                endRuAuthorization(session, "ru_wireguard_authorization_changed")
-                return
-            }
-            val api = underlyingNetworkSource.currentSnapshot()?.network?.let(backendApi::onNetwork) ?: backendApi
-            var token = settings.backendAccessToken ?: run {
-                endRuAuthorization(session, "ru_wireguard_authorization_changed")
-                return
-            }
-            val response = try {
-                withTimeoutOrNull(RU_STATUS_TIMEOUT_MS) {
-                    api.pollRuWireGuardSession(token, settings.backendDeviceId, settings.backendDeviceKey, session.identity)
-                } ?: return
-            } catch (error: BackendException) {
-                if (error.statusCode != 401) throw error
-                val refreshed = try {
-                    AuthTokenRefresher(repository, api,
-                        onRevocationPending = { PendingLogoutRevocationWorker.enqueue(applicationContext) },
-                    ).refreshStoredTokens()
-                } catch (cancelled: CancellationException) {
-                    throw cancelled
-                } catch (refreshError: Exception) {
-                    if (BackendRetryPolicy.isTransient(refreshError)) return
-                    null
-                }
-                token = refreshed?.accessToken ?: run {
-                    endRuAuthorization(session, "ru_wireguard_authorization_revoked")
-                    return
-                }
-                withTimeoutOrNull(RU_STATUS_TIMEOUT_MS) {
-                    api.pollRuWireGuardSession(token, settings.backendDeviceId, settings.backendDeviceKey, session.identity)
-                } ?: return
-            }
-            when (response) {
-                is BackendRuWireGuardSession.Pending ->
-                    endRuAuthorization(session, "ru_wireguard_status_regressed")
-                is BackendRuWireGuardSession.Ready -> if (response.wireguard != session.wireguard)
-                    endRuAuthorization(session, "ru_wireguard_session_changed")
-            }
-        } catch (cancelled: CancellationException) {
-            throw cancelled
-        } catch (error: Exception) {
-            if (prepareFailureReason(error) == "client_update_required") {
-                endRuAuthorization(session, "client_update_required")
-            } else if (error is BackendException && error.statusCode in setOf(401, 403, 404, 409)) {
-                endRuAuthorization(session, "ru_wireguard_authorization_revoked")
-            } else if (!BackendRetryPolicy.isTransient(error)) {
-                endRuAuthorization(session, "ru_wireguard_status_invalid")
-            }
+            val delay = EndpointProbeRunner.awaitNativeProbe(probe.measure, probe.cancel).delayMs
+            delay.takeIf { underlyingNetworkSource.currentSnapshot()?.signature == network }
         } finally {
-            ruStatusInFlight.set(false)
+            probe.cancel()
         }
     }
 
@@ -3109,9 +3175,9 @@ class AppVpnService : VpnService() {
             latest.backendDeviceId == baseline.backendDeviceId && latest.backendDeviceKey == baseline.backendDeviceKey &&
             !VpnSettingsTransactionPolicy.candidateBecameStale(baseline, latest)
 
-    private suspend fun endRuAuthorization(session: BackendRuWireGuardSession.Ready, reason: String) {
+    private suspend fun endRuAuthorization(session: ActiveRuRoute, reason: String) {
         connectionOrchestrator.withLifecycleLock {
-            if (ruSession === session) {
+            if (ruRoute === session) {
                 val repository = SettingsRepository(this)
                 failStart(repository, reason, retryBlockedTunnel = false)
             }
@@ -3131,7 +3197,7 @@ class AppVpnService : VpnService() {
         endpointHealthController.stop(owner)
         stopConnectedWatchdog()
         stopNotificationTicker()
-        DeviceTrafficMonitor.stop()
+        publishIfCurrentService { DeviceTrafficMonitor.stop() }
         warmupController.stop(owner)
     }
 
@@ -3143,7 +3209,7 @@ class AppVpnService : VpnService() {
             delayMillis = delayMillis,
             task = {
                 if (currentRuntimeMode == VpnRuntimeMode.AUTH_TEMP) {
-                    startService(stopIntent(this))
+                    publishIfCurrentService { startService(stopIntent(this)) }
                 }
             },
         )
@@ -3170,9 +3236,9 @@ class AppVpnService : VpnService() {
         ) {
             connectedAtMillis = null
             statsCoordinator.reset()
-            SettingsRepository(this).clearVpnRuntimeState()
+            clearPublishedRuntimeState(SettingsRepository(this))
             broadcastState(VpnConnectionState.DISCONNECTED)
-            stopSelf()
+            stopOwnedService()
             return
         }
         broadcastState(currentState)
@@ -3191,25 +3257,46 @@ class AppVpnService : VpnService() {
         }
         val publicConnectedAtMillis = connectedAtMillis.takeIf { publicState == VpnConnectionState.CONNECTED }
         currentState = publicState
-        updateLiveRuntimeState(publicState, publicConnectedAtMillis, currentRuntimeMode,
-            ruSession?.identity?.sessionId, latencyMs, connectionOrchestrator.nokiNvCarrier())
-        val intent = Intent(ACTION_STATE_CHANGED)
-            .setPackage(packageName)
-            .putExtra(EXTRA_STATE, publicState.name)
-            .putExtra(EXTRA_REASON, reason.orEmpty())
-            .putExtra(EXTRA_CONNECTED_AT, publicConnectedAtMillis ?: 0L)
-            .putExtra(EXTRA_RUNTIME_MODE, currentRuntimeMode.name)
-            .putExtra(EXTRA_NOKINV_CARRIER, liveRuntimeState().nokiNvCarrier)
-        latencyLocationCode?.takeIf { it.isNotBlank() }?.let { code ->
-            intent.putExtra(EXTRA_LATENCY_LOCATION_CODE, code)
+        val carrier = connectionOrchestrator.nokiNvCarrier()
+        publishIfCurrentService {
+            updateLiveRuntimeState(publicState, publicConnectedAtMillis, currentRuntimeMode,
+                null, latencyMs, carrier)
+            val intent = Intent(ACTION_STATE_CHANGED)
+                .setPackage(packageName)
+                .putExtra(EXTRA_STATE, publicState.name)
+                .putExtra(EXTRA_REASON, reason.orEmpty())
+                .putExtra(EXTRA_CONNECTED_AT, publicConnectedAtMillis ?: 0L)
+                .putExtra(EXTRA_RUNTIME_MODE, currentRuntimeMode.name)
+                .putExtra(EXTRA_NOKINV_CARRIER, liveRuntimeState().nokiNvCarrier)
+            latencyLocationCode?.takeIf { it.isNotBlank() }?.let { code ->
+                intent.putExtra(EXTRA_LATENCY_LOCATION_CODE, code)
+            }
+            liveRuntimeState().latencyMs?.let { value ->
+                intent.putExtra(EXTRA_LATENCY_MS, value)
+            }
+            sendBroadcast(
+                intent,
+            )
+            NokiQuickSettingsTileService.requestTileRefresh(this)
         }
-        liveRuntimeState().latencyMs?.let { value ->
-            intent.putExtra(EXTRA_LATENCY_MS, value)
-        }
-        sendBroadcast(
-            intent,
-        )
-        NokiQuickSettingsTileService.requestTileRefresh(this)
+    }
+
+    private fun isCurrentService(): Boolean = publicStateSequence.get() == publicStateOwner
+
+    private fun publishIfCurrentService(action: () -> Unit) {
+        synchronized(publicStateLock) { if (isCurrentService()) action() }
+    }
+
+    private fun clearPublishedRuntimeState(repository: SettingsRepository) =
+        publishIfCurrentService { repository.clearVpnRuntimeState() }
+
+    private fun startOwnedForeground(id: Int, notification: Notification) =
+        publishIfCurrentService { startForeground(id, notification) }
+
+    private fun stopOwnedForeground(flags: Int) = publishIfCurrentService { stopForeground(flags) }
+
+    private fun stopOwnedService(startId: Int? = null) = publishIfCurrentService {
+        if (startId == null) stopSelf() else stopSelfResult(startId)
     }
 
     data class LiveRuntimeState(
@@ -3222,6 +3309,8 @@ class AppVpnService : VpnService() {
     )
 
     companion object {
+        private val publicStateLock = Any()
+        private val publicStateSequence = AtomicLong()
         private const val TAG = "NokiVpnService"
         private const val ACTION_START = "com.noki.vpn.START"
         private const val ACTION_START_TEMPORARY = "com.noki.vpn.START_TEMPORARY"
@@ -3245,8 +3334,6 @@ class AppVpnService : VpnService() {
         private const val NOTIFICATION_SPEED_UPDATE_INTERVAL_MS = 1_000L
         private const val DATA_PATH_EVIDENCE_FRESH_MS = 5 * 60_000L
         private const val APP_NOTIFICATION_POLL_INTERVAL_MS = 60_000L
-        private const val RU_STATUS_INTERVAL_MS = 5 * 60_000L
-        private const val RU_STATUS_TIMEOUT_MS = 15_000L
         private const val STARTUP_TCP_PRECHECK_TIMEOUT_MS = 800
         private const val BACKGROUND_ENDPOINT_WARMUP_DELAY_MS = 18_000L
         private const val NETWORK_CHANGE_DEBOUNCE_MS = 2_500L

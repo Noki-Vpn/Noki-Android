@@ -24,6 +24,20 @@ import org.junit.Assert.assertTrue
 import org.junit.Test
 
 class VpnConnectionPreparerTest {
+    @Test fun `new automatic or country start refreshes an otherwise usable persisted node`() = runBlocking {
+        for (mode in listOf(com.noki.vpn.data.ServerSelectionMode.AUTO, com.noki.vpn.data.ServerSelectionMode.COUNTRY)) {
+            val settings = cachedSettings().copy(backendAccessToken = "token", isAuthenticated = true,
+                userProfile = cachedSettings().userProfile.copy(serverSelectionMode = mode))
+            var requests = 0
+            val preparer = VpnConnectionPreparer(PreparerStore(settings), { EndpointRankingPolicy.NetworkKind.WIFI },
+                resolveStart = { _, _, _, _ -> requests++; VpnStartCoordinator.StartDecision.Failure(BackendException("fresh_selection", 400)) },
+                refreshAccessToken = { error("No auth failure") })
+            val result = preparer.prepare(VpnPreparationStrategy.CachedFirst)
+            assertTrue("$mode must reconsider the persisted node on a new start", result is VpnConnectionPreparer.Outcome.Failure)
+            assertEquals(1, requests)
+        }
+    }
+
     @Test fun `prepared grants are single use and bound to TTL physical network account and settings`() = runBlocking {
         val settings = cachedSettings().copy(isAuthenticated = true, backendAccessToken = "prepared-test")
         val session = com.noki.vpn.data.BackendVpnSession(
@@ -366,6 +380,7 @@ class VpnConnectionPreparerTest {
             transport = "xhttp", transportMode = "stream-up")
         return baseline.copy(
             advancedSettings = baseline.advancedSettings.copy(ruRelayEnabled = false),
+            userProfile = baseline.userProfile.copy(serverSelectionMode = com.noki.vpn.data.ServerSelectionMode.SERVER, selectedNodeId = "selected-node"),
             profile = baseline.profile.copy(
                 endpointCode = endpoint.code,
                 transport = endpoint.transport,

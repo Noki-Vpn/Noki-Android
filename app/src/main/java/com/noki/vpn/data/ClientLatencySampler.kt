@@ -10,6 +10,7 @@ import kotlinx.coroutines.sync.withPermit
 import kotlinx.coroutines.withTimeoutOrNull
 import java.util.Locale
 import android.content.Context
+import android.net.ConnectivityManager
 import com.noki.vpn.vpn.AndroidUnderlyingNetworkSource
 
 internal fun clientLatencyTargetKey(location: ServerLocation): String? =
@@ -43,37 +44,47 @@ class ClientLatencySampler(
     private val context: Context? = null,
     private val tcpAttempts: Int = LATENCY_TCP_ATTEMPTS,
 ) {
+    private data class ProbeTarget(val key: String?, val host: String?, val port: Int?, val ip: String? = null)
     fun networkSignature(): String = context?.let { AndroidUnderlyingNetworkSource(it).currentSnapshot()?.signature } ?: "none"
 
     suspend fun measure(
         locations: List<ServerLocation>,
     ): Map<String, Int> {
         val targets = locations.asSequence().filter { it.isOnline }.flatMap { location ->
-            if (location.servers.isEmpty()) sequenceOf(Triple(clientLatencyTargetKey(location), location.host, 443))
-            else location.servers.asSequence().filter { it.isOnline }.map { Triple(clientLatencyTargetKey(it), it.host, it.probePort) }
-        }.distinctBy { it.first }.toList()
+            location.servers.asSequence().filter { it.isOnline }.map {
+                ProbeTarget(clientLatencyTargetKey(it), it.probeHost ?: it.host, it.probePort, it.probeIp)
+            }
+        }.distinctBy { it.key }.toList()
         return measureTargets(targets, allowIcmpFallback = true)
     }
 
     suspend fun measureRelayTargets(targets: Map<String, List<Pair<String, Int>>>): Map<String, Int> =
-        measureTargets(targets.flatMap { (key, values) -> values.map { (host, port) -> Triple(key, host, port) } }, false)
+        measureTargets(targets.flatMap { (key, values) -> values.map { (host, port) -> ProbeTarget(key, host, port) } }, false)
+
+    suspend fun <T> measureNodes(nodes: List<T>, id: (T) -> String,
+        host: (T) -> String?, port: (T) -> Int?, ip: (T) -> String?): Map<String, Int> =
+        measureTargets(nodes.distinctBy(id).take(64).map { ProbeTarget(id(it), host(it), port(it), ip(it)) }, false)
 
     private suspend fun measureTargets(
-        targets: List<Triple<String?, String, Int?>>, allowIcmpFallback: Boolean,
+        targets: List<ProbeTarget>, allowIcmpFallback: Boolean,
     ): Map<String, Int> = coroutineScope {
-        val network = context?.let { AndroidUnderlyingNetworkSource(it).currentSnapshot()?.network }
+        val snapshot = context?.let { AndroidUnderlyingNetworkSource(it).currentSnapshot() }
+        val network = snapshot?.network
         if (context != null && network == null) return@coroutineScope emptyMap()
+        val interfaceName = if (context != null && network != null) {
+            (context.getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager).getLinkProperties(network)?.interfaceName
+        } else null
         val probeSlots = Semaphore(DeviceLatency.MAX_CONCURRENT_DNS_LOOKUPS)
         targets.asSequence()
             .distinct()
-            .mapNotNull { (key, rawHost, port) ->
+            .mapNotNull { (key, rawHost, port, probeIp) ->
                 val targetKey = key ?: return@mapNotNull null
-                val host = rawHost.trim()
+                val host = rawHost?.trim().orEmpty()
                 async {
                     val latency = withTimeoutOrNull(locationTimeoutMillis.coerceAtLeast(1L)) {
                         probeSlots.withPermit {
                             runInterruptible(Dispatchers.IO) {
-                                if (port == null) null else {
+                                if (port != null && port in 1..65535 && host.isNotBlank()) {
                                     val samples = List(tcpAttempts.coerceIn(1, LATENCY_TCP_ATTEMPTS)) {
                                         if (network == null) tcpConnect(host, port, LATENCY_TCP_TIMEOUT_MS)
                                         else DeviceLatency.measureTcpConnectMs(host, port, LATENCY_TCP_TIMEOUT_MS,
@@ -84,11 +95,13 @@ class ClientLatencySampler(
                                         ?: if (context == null && allowIcmpFallback) {
                                             icmpPing(host, LATENCY_ICMP_COUNT, LATENCY_ICMP_TIMEOUT_SECONDS)
                                         } else null
-                                }
+                                } else if (probeIp != null && interfaceName != null) {
+                                    DeviceLatency.measureIcmpOnInterface(probeIp, interfaceName)
+                                } else null
                             }
                         }
                     }
-                    latency?.let { targetKey to it }
+                    latency?.takeIf { it in 1..3000 }?.let { targetKey to it }
                 }
             }
             .toList()
@@ -96,12 +109,17 @@ class ClientLatencySampler(
             .filterNotNull()
             .groupBy({ it.first }, { it.second })
             .mapValues { (_, samples) -> samples.min() }
+            .takeIf { context == null || AndroidUnderlyingNetworkSource(context).currentSnapshot()?.signature == snapshot?.signature }
+            .orEmpty()
     }
 
-    private companion object {
-        const val LATENCY_TCP_ATTEMPTS = 3
-        const val LATENCY_TCP_TIMEOUT_MS = 650
-        const val LATENCY_ICMP_COUNT = 1
-        const val LATENCY_ICMP_TIMEOUT_SECONDS = 1
+    companion object {
+        fun startup(context: Context): ClientLatencySampler =
+            ClientLatencySampler(context = context, locationTimeoutMillis = 750L, tcpAttempts = 1)
+
+        private const val LATENCY_TCP_ATTEMPTS = 3
+        private const val LATENCY_TCP_TIMEOUT_MS = 650
+        private const val LATENCY_ICMP_COUNT = 1
+        private const val LATENCY_ICMP_TIMEOUT_SECONDS = 1
     }
 }

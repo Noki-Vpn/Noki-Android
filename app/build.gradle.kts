@@ -1,4 +1,5 @@
 import java.util.Properties
+import groovy.json.JsonSlurper
 import java.net.URI
 import java.security.MessageDigest
 import java.util.zip.ZipFile
@@ -43,19 +44,17 @@ val googleWebClientId = providers.gradleProperty("noki.googleWebClientId")
     .orElse("")
     .get()
 val libboxAarFile = layout.projectDirectory.file("libs/libbox.aar")
-val libboxAarSha256 = "228E70B1B1C91817AFFC45E834B886D11F299862AF4E40C33D2B53E04EE1F94E"
 val libboxSourceFile = layout.projectDirectory.file("libs/libbox.SOURCE.zip")
-val libboxSourceSha256 = "B9253F9BDBC84964B4401D241A13A1009D8BBF9641E5F7212E093DCE7EFBDD2B"
-val geositeFile = layout.projectDirectory.file("src/main/assets/geosite.dat")
-val geositeSha256 = "1B9012AB376E142DA68506385E4B0590ABEB20A0DEAC0169293E1057FCE8D949"
-val geositeSourceFile = layout.projectDirectory.file("../third_party/geosite/SOURCE.zip")
-val geositeSourceSha256 = "09E547AB2E7B76A24081243EF8E7EF0432D70C2551F2E7EFCA1A3F290B731CEE"
+val libboxSourceSha256 = "8370DFB5769BBBDD515738CF4FA195A51C47F226340D3DABEFCCD44DEEC3F8C9"
+val geodataFile = layout.projectDirectory.file("src/main/assets/geodata.zip")
+val geodataSha256 = "CC1BE34E2AC3605A6265E9E58437591473FA5E2833528CF4DCA139CDB418F9A1"
 val geositeLicenseFile = layout.projectDirectory.file("src/main/assets/licenses/geosite/LICENSE")
+val geoipLicenseFile = layout.projectDirectory.file("src/main/assets/licenses/geoip/LICENSE")
 val prismalAarFile = layout.projectDirectory.file("libs/prismal-1.0.3.aar")
 val prismalAarSha256 = "40D5EAFC3B68554E0D5E159EA02ECDA8CA86EB32A43DC1B3BAE5C65344C08C2A"
 val supportedAbis = listOf("arm64-v8a", "armeabi-v7a", "x86_64")
-val expectedReleaseVersionCode = 322
-val expectedReleaseVersionName = "2.3.6"
+val expectedReleaseVersionCode = 328
+val expectedReleaseVersionName = "2.3.12"
 
 fun String.toBuildConfigString(): String =
     "\"${replace("\\", "\\\\").replace("\"", "\\\"")}\""
@@ -202,13 +201,24 @@ tasks.register("verifyLibboxAar") {
     inputs.files(libboxAarFile, libboxSourceFile)
     doLast {
         val aar = libboxAarFile.asFile
-        for ((artifact, expected) in listOf(aar to libboxAarSha256, libboxSourceFile.asFile to libboxSourceSha256)) {
+        val source = libboxSourceFile.asFile
+        fun verifyChecksum(artifact: File, expected: String) {
             require(artifact.exists()) { "${artifact.name} must exist at ${artifact.relativeTo(projectDir)}" }
             val actual = sha256Hex(artifact)
             require(actual.equals(expected, ignoreCase = true)) {
                 "${artifact.name} checksum mismatch: expected $expected, got $actual"
             }
         }
+        verifyChecksum(source, libboxSourceSha256)
+        val expectedAar = ZipFile(source).use { archive ->
+            archive.getInputStream(archive.getEntry("build-inputs.json")).use { stream ->
+                (JsonSlurper().parse(stream) as Map<*, *>)["aar_sha256"] as? String
+            }
+        }
+        requireNotNull(expectedAar) {
+            "Rebuild libbox.aar from libbox.SOURCE.zip with scripts/build-libbox.ps1 and pin the resulting AAR checksum in build-inputs.json"
+        }
+        verifyChecksum(aar, expectedAar)
         ZipFile(aar).use { archive ->
             for (abi in supportedAbis) {
                 require(archive.getEntry("jni/$abi/libbox.so") != null) { "libbox.aar missing ABI: $abi" }
@@ -235,24 +245,12 @@ tasks.register("verifyPrismalAar") {
 }
 
 tasks.register("verifyGeositeSource") {
-    inputs.files(geositeFile, geositeSourceFile, geositeLicenseFile)
+    inputs.files(geodataFile, geositeLicenseFile, geoipLicenseFile)
     doLast {
-        for ((artifact, expected) in listOf(geositeFile.asFile to geositeSha256, geositeSourceFile.asFile to geositeSourceSha256)) {
-            require(artifact.exists()) { "${artifact.name} must exist at ${artifact.relativeTo(projectDir)}" }
-            require(sha256Hex(artifact).equals(expected, ignoreCase = true)) {
-                "${artifact.name} checksum mismatch"
-            }
+        require(geodataFile.asFile.isFile && sha256Hex(geodataFile.asFile).equals(geodataSha256, ignoreCase = true)) {
+            "Geodata bundle checksum mismatch"
         }
-        ZipFile(geositeSourceFile.asFile).use { archive ->
-            for (member in listOf("build-inputs.json", "src/main.go", "src/go.mod", "src/go.sum", "src/data/category-ru", "src/vendor/modules.txt")) {
-                require(archive.getEntry(member) != null) { "Geosite source missing: $member" }
-            }
-            require(geositeLicenseFile.asFile.exists()) { "Geosite license notice is missing" }
-            val license = requireNotNull(archive.getEntry("src/LICENSE")) { "Geosite source license is missing" }
-            require(archive.getInputStream(license).use { it.readBytes() }.contentEquals(geositeLicenseFile.asFile.readBytes())) {
-                "Geosite bundled license differs from source"
-            }
-        }
+        require(geositeLicenseFile.asFile.isFile && geoipLicenseFile.asFile.isFile) { "Geodata license notice is missing" }
     }
 }
 

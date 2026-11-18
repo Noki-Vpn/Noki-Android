@@ -188,12 +188,14 @@ object EndpointSelector {
         candidate: BackendEndpointCandidate,
     ): VlessProfile {
         session.multiHop?.let { route ->
-            require(candidate.nodeId == route.exitNodeId && candidate.entryHost == route.entryIp &&
-                candidate.connectIp == route.entryIp && candidate.entryPort in 20000..29999) { "multihop_exit_mismatch" }
+            val valid = if (route.version == 3) session.entryRoute && candidate.nodeId == route.entryNodeId
+                else candidate.nodeId == route.exitNodeId && candidate.entryHost == route.entryIp &&
+                    candidate.connectIp == route.entryIp && candidate.entryPort in 20000..29999
+            require(valid) { if (route.version == 3) "multihop_entry_mismatch" else "multihop_exit_mismatch" }
         }
         return profileFromCandidate(candidate.copy(proxyType = candidate.proxyType.ifBlank { session.proxyType }),
             session.vpnSecret, session.vpnUsername)
-            .copy(remark = "Noki ${candidate.locationName.ifBlank { session.locationName }}", multiHop = session.multiHop,
+            .copy(remark = "Noki ${candidate.locationName.ifBlank { session.locationName }}", multiHop = session.multiHop, entryRoute = session.entryRoute, entryRouteExpiresAt = session.entryRouteExpiresAt,
                 nokinvToken = if (candidate.proxyType == "nokinv") session.nokinvToken else "",
                 nokinvCredentialGeneration = if (candidate.proxyType == "nokinv") session.nokinvCredentialGeneration else 0)
     }

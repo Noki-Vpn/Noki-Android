@@ -424,7 +424,7 @@ class BackendApiClient(
             .put("device_nonce", deviceNonce)
             .put("device_signature", deviceSignature)
             .put("profile_code", if (hops != null) "auto" else profileCode)
-            .put("capabilities", JSONArray(listOf("nokinv_v1", "nokinv_release_v1")))
+            .put("capabilities", JSONArray(listOf("nokinv_v1", "nokinv_release_v1", "entry_route_v1")))
             .put("country_code", countryCode)
             .put("location_code", locationCode)
             .put("exclude_location_code", excludeLocationCode)
@@ -444,10 +444,23 @@ class BackendApiClient(
                 .get().build()).toLocationList()
         }
 
+    suspend fun youtubeNodes(token: String, deviceId: String, deviceKey: String): List<VpnServer> = withContext(Dispatchers.IO) {
+        val url = jsonApi.apiUrl("/vpn/youtube-nodes").toHttpUrl().newBuilder()
+            .addQueryParameter("device_id", canonicalRuUuid(deviceId)).build()
+        val json = execute(Request.Builder().url(url).header("Authorization", "Bearer $token")
+            .currentDeviceHeaders(deviceId, deviceKey).get().build())
+        val nodes = json.getJSONArray("nodes")
+        (0 until nodes.length()).map { nodes.getJSONObject(it).toSelectionNode() }.also { result ->
+            require(result.map { it.id }.distinct().size == result.size) { "node_selection_duplicate" }
+        }
+    }
+
     suspend fun createYoutubeAccess(token: String, requestId: String, deviceId: String,
-                                    deviceKey: String, publicKeyId: String): BackendYoutubeAccess =
+                                     deviceKey: String, publicKeyId: String,
+                                     nodeRttSamples: List<RuRelayRttSample> = emptyList()): BackendYoutubeAccess =
         youtubeAccessRequest(token, deviceId, deviceKey, "/vpn/youtube-access",
-            JSONObject().put("request_id", canonicalRuUuid(requestId)).put("public_key_id", canonicalRuUuid(publicKeyId)))
+            JSONObject().put("request_id", canonicalRuUuid(requestId)).put("public_key_id", canonicalRuUuid(publicKeyId))
+                .apply { if (nodeRttSamples.isNotEmpty()) put("node_rtt_samples", nodeRttSamples.toNodeRttJson()) })
 
     suspend fun pollYoutubeAccess(token: String, deviceId: String, deviceKey: String,
                                   grantId: String): BackendYoutubeAccess =
@@ -504,6 +517,16 @@ class BackendApiClient(
             .get().build())
         RuRelayCatalogJsonParser.parse(json, exitId, entryId, routeVersion)
     }
+
+    internal suspend fun enrollRuEntry(
+        token: String, deviceId: String, deviceKey: String, nonce: String, signature: String,
+        publicKeyId: String, relayNodeId: String,
+    ): RuEntryCredential = RuWireGuardSessionJsonParser.parseEntryCredential(
+        postJson("/vpn/ru-entry", JSONObject().put("device_id", deviceId).put("device_key", deviceKey)
+            .put("device_nonce", nonce).put("device_signature", signature).put("public_key_id", canonicalRuUuid(publicKeyId))
+            .put("relay_node_id", canonicalRuUuid(relayNodeId)), token),
+        expectedRelay = relayNodeId,
+    )
 
     override suspend fun createRuWireGuardSession(
         token: String,
@@ -888,9 +911,9 @@ class BackendApiClient(
         abis: List<String>,
     ): Boolean = contentClient.androidUpdateAvailable(token, versionCode, abis)
 
-    suspend fun geositeMetadata(): Pair<String, Int> = contentClient.geositeMetadata()
+    internal suspend fun geodataMetadata(): GeodataMetadata? = contentClient.geodataMetadata()
 
-    suspend fun downloadGeosite(expectedSize: Int): ByteArray = contentClient.downloadGeosite(expectedSize)
+    internal suspend fun downloadGeodata(metadata: GeodataMetadata): ByteArray = contentClient.downloadGeodata(metadata)
 
     suspend fun uploadAvatar(
         token: String,

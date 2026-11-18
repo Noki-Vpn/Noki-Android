@@ -14,6 +14,9 @@ internal class YoutubeConnection(
     private val repository: SettingsRepository,
     private val api: () -> BackendApiClient,
     private val onConfigurationChanged: () -> Unit,
+    private val measureNodes: suspend (List<VpnServer>) -> Map<String, Int> = { nodes ->
+        ClientLatencySampler.startup(context).measureNodes(nodes, { it.id }, { it.probeHost }, { it.probePort }, { it.probeIp })
+    },
 ) {
     @Volatile private var configuration: YoutubeConnectionConfig? = null
     @Volatile private var validUntil = 0L
@@ -92,22 +95,32 @@ internal class YoutubeConnection(
             var keyId: String? = null
             var requestId = UUID.randomUUID().toString()
             var transientFailures = 0
+            var selectionSamples: List<RuRelayRttSample>? = null
             while (currentCoroutineContext().isActive && owner == sequence) {
                 try {
                     val settings = repository.load()
                     check(targetFor(settings) == expectedTarget) { "youtube_selection_changed" }
                     if (grant?.let { it.expiresAtEpochMillis <= System.currentTimeMillis() } == true) {
                         grant = null
+                        selectionSamples = null
                         requestId = UUID.randomUUID().toString()
                     }
                     val previous = grant
                     val response = authorized { client, token, current ->
                         check(targetFor(current) == expectedTarget) { "youtube_selection_changed" }
                         if (previous == null) {
+                            if (selectionSamples == null) {
+                                val nodes = try { client.youtubeNodes(token, current.backendDeviceId, current.backendDeviceKey) }
+                                    catch (error: BackendException) { if (error.statusCode == 404) emptyList() else throw error }
+                                val samples = measureNodes(nodes)
+                                selectionSamples = nodes.distinctBy { it.id }.mapNotNull { node ->
+                                    samples[node.id]?.takeIf { it in 1..3000 }?.let { RuRelayRttSample(node.id, it) }
+                                }.take(64)
+                            }
                             if (keyId == null) keyId = client.registerRuWireGuardKey(token, current.backendDeviceId,
                                 current.backendDeviceKey, pair.publicKeyBase64()).id
                             client.createYoutubeAccess(token, requestId, current.backendDeviceId, current.backendDeviceKey,
-                                checkNotNull(keyId))
+                                checkNotNull(keyId), selectionSamples.orEmpty())
                         } else if (previous.status == "ready") {
                             client.renewYoutubeAccess(token, current.backendDeviceId, current.backendDeviceKey, previous)
                         } else {
@@ -127,6 +140,7 @@ internal class YoutubeConnection(
                         publish(owner, null)
                         if (needsFreshAdmission(response, System.currentTimeMillis())) {
                             grant = null
+                            selectionSamples = null
                             requestId = UUID.randomUUID().toString()
                             delay(2_000)
                             continue

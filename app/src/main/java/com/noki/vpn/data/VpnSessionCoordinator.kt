@@ -33,9 +33,7 @@ class VpnSessionCoordinator(
     ) -> EndpointSelector.EndpointSelectionResult)? = null,
     private val onDiagnostic: (String) -> Unit = {},
     private val measureClientLatencies: suspend (List<ServerLocation>) -> Map<String, Int> = { locations ->
-        if (context == null) emptyMap() else ClientLatencySampler(
-            context = context, locationTimeoutMillis = 750L, tcpAttempts = 1,
-        ).measure(locations)
+        if (context == null) emptyMap() else ClientLatencySampler.startup(context).measure(locations)
     },
 ) {
     private var sessionApi: VpnSessionApi = backendApi
@@ -69,10 +67,50 @@ class VpnSessionCoordinator(
         val network = context?.let { com.noki.vpn.vpn.AndroidUnderlyingNetworkSource(it).currentSnapshot()?.network }
         sessionApi = if (backendApi is BackendApiClient && network != null) backendApi.onNetwork(network) else backendApi
         if (settings.advancedSettings.multiHop.enabled) {
-            settings.advancedSettings.multiHop.explicitNodeIds()
-            val prepared = prepareAtNode(token, settings, knownDevices, VpnSessionSelection(countryCode = ""))
+            val route = settings.advancedSettings.multiHop
+            for (hop in listOf(route.entry, route.exit)) {
+                requireNotNull(hop) { "multihop_selector_missing" }
+                when (hop.kind) {
+                    ServerSelectionMode.SERVER -> canonicalRuUuid(requireNotNull(hop.nodeId) { "multihop_selector_missing" })
+                    ServerSelectionMode.COUNTRY -> require(hop.countryCode?.matches(Regex("[A-Za-z]{2}")) == true) { "multihop_selector_invalid" }
+                    ServerSelectionMode.AUTO -> throw IllegalArgumentException("multihop_selector_invalid")
+                }
+            }
+            if (route.entry?.kind == ServerSelectionMode.SERVER && route.exit?.kind == ServerSelectionMode.SERVER) route.explicitNodeIds()
+            val catalog = backendStep("server_catalog") {
+                sessionApi.serverLocations(token, settings.backendDeviceId.ifBlank { null }, settings.backendDeviceKey.ifBlank { null })
+            }
+            val locations = BootstrapStateMapper.mapLocations(catalog, settings.personalizationSettings.language, emptyMap())
+            val nodes = locations.flatMap { it.servers }.filter { it.isOnline && it.weight > 0 && it.id !in sessionSelection.excludedNodeIds }
+            fun matches(node: VpnServer, selection: HopSelection?): Boolean = when (selection?.kind) {
+                ServerSelectionMode.SERVER -> node.id == selection.nodeId
+                ServerSelectionMode.COUNTRY -> node.countryCode.equals(selection.countryCode, true)
+                else -> false
+            }
+            val exits = nodes.filter { it.multiHopExitAvailable && matches(it, route.exit) }
+            val entries = nodes.filter { it.multiHopEntryAvailable && matches(it, route.entry) && exits.any { exit -> exit.id != it.id } }
+            val automaticNodes = ((if (route.entry?.kind == ServerSelectionMode.COUNTRY) entries else emptyList()) +
+                (if (route.exit?.kind == ServerSelectionMode.COUNTRY) exits else emptyList())).distinctBy { it.id }
+            val samples = if (automaticNodes.size < 2) emptyMap() else {
+                val ids = automaticNodes.map { it.id }.toSet()
+                measureClientLatencies(locations.mapNotNull { location ->
+                    location.servers.filter { it.id in ids }.takeIf { it.isNotEmpty() }?.let { location.copy(servers = it) }
+                })
+            }
+            fun measured(nodes: List<VpnServer>) = nodes.map { it.copy(latencyMs = clientLatencyTargetKey(it)?.let(samples::get)) }
+            val automatic = UserProfile(serverSelectionMode = ServerSelectionMode.AUTO)
+            val entry = EndpointRankingPolicy.rankServers(measured(entries), automatic).firstOrNull()
+                ?: throw BackendException("entry_route_unavailable", 503)
+            val exit = EndpointRankingPolicy.rankServers(measured(exits.filter { it.id != entry.id }), automatic).first()
+            val selected = route.copy(entry = HopSelection(ServerSelectionMode.SERVER, nodeId = entry.id),
+                exit = HopSelection(ServerSelectionMode.SERVER, nodeId = exit.id))
+            val prepared = prepareAtNode(token, settings, knownDevices, VpnSessionSelection(countryCode = "", nodeId = entry.id,
+                excludeNokiNv = true), selected)
             if (!VpnProfileValidator.isUsable(prepared.settings)) throw UnusableFreshProfileException()
-            return@withContext prepared
+            return@withContext prepared.copy(settings = prepared.settings.copy(
+                advancedSettings = prepared.settings.advancedSettings.copy(multiHop = route),
+                userProfile = prepared.settings.userProfile.copy(selectedServerCode = entry.locationCode, actualCountryCode = exit.countryCode),
+            ))
         }
         val explicitNode = sessionSelection.nodeId ?: settings.userProfile.selectedNodeId.takeIf {
             settings.userProfile.serverSelectionMode == ServerSelectionMode.SERVER && it.isNotBlank()
@@ -143,6 +181,7 @@ class VpnSessionCoordinator(
         settings: StoredSettings,
         knownDevices: List<BackendDevice>,
         sessionSelection: VpnSessionSelection,
+        localRoute: MultiHopSettings? = null,
     ): Result = withContext(Dispatchers.IO) {
         val deviceSession = createDeviceSession(
             token = token,
@@ -153,33 +192,37 @@ class VpnSessionCoordinator(
             sessionSelection = sessionSelection,
         )
 
+        val session = if (localRoute != null) {
+            if (!deviceSession.session.entryRoute) throw BackendException("entry_route_unavailable", 503)
+            deviceSession.session.copy(multiHop = BackendMultiHopSession.atEntry(localRoute))
+        } else deviceSession.session
         val networkKind = context?.let(EndpointSelector::currentNetworkKind)
             ?: EndpointRankingPolicy.NetworkKind.OTHER
         val multiHop = settings.advancedSettings.multiHop.enabled
-        val selectionSession = if (sessionSelection.excludeNokiNv) deviceSession.session.copy(
-            endpointCandidates = deviceSession.session.endpointCandidates.filterNot { it.proxyType.equals("nokinv", true) },
-        ).also { if (it.endpointCandidates.isEmpty()) throw UnusableFreshProfileException() } else deviceSession.session
+        val selectionSession = if (sessionSelection.excludeNokiNv || session.entryRoute) session.copy(
+            endpointCandidates = session.endpointCandidates.filterNot { it.proxyType.equals("nokinv", true) },
+        ).also { if (it.endpointCandidates.isEmpty()) throw UnusableFreshProfileException() } else session
         val endpointHealth = if (multiHop) emptyMap() else repository.loadEndpointHealth(networkKind)
         val tcpPrecheck = if (multiHop) null else startupTcpPrecheck ?: ::defaultStartupTcpPrecheck
         val selection = endpointSelectionProvider?.invoke(
             selectionSession,
-            settings.advancedSettings,
+            settings.advancedSettings.copy(multiHop = localRoute ?: settings.advancedSettings.multiHop),
             endpointHealth,
             repository::nextEndpointRotationIndex,
             tcpPrecheck,
         ) ?: EndpointSelector.selectionForSession(
             context = requireContext(),
             session = selectionSession,
-            settings = settings.advancedSettings,
+            settings = settings.advancedSettings.copy(multiHop = localRoute ?: settings.advancedSettings.multiHop),
             endpointHealth = endpointHealth,
             rotationIndex = repository::nextEndpointRotationIndex,
             startupTcpPrecheck = tcpPrecheck,
             networkKind = networkKind,
             onDiagnostic = onDiagnostic,
         )
-        val endpointOptions = EndpointSelector.optionsFromSession(deviceSession.session)
+        val endpointOptions = EndpointSelector.optionsFromSession(selectionSession)
         val advancedSettings = EndpointGroupPolicy.settingsAfterSelection(
-            settings = settings.advancedSettings,
+            settings = settings.advancedSettings.copy(multiHop = localRoute ?: settings.advancedSettings.multiHop),
             endpointCode = selection.endpointCode,
             endpointOptions = endpointOptions,
         )
@@ -200,7 +243,7 @@ class VpnSessionCoordinator(
         onDiagnostic("stage=validation; reason=${VpnProfileValidator.rejectionReason(updatedSettings) ?: "ok"}; endpoint=${selection.endpointCode}; candidates=${endpointOptions.size}")
         Result(
             settings = updatedSettings,
-            session = deviceSession.session,
+            session = selectionSession,
             currentDevice = deviceSession.currentDevice,
             selection = selection,
         )
@@ -287,8 +330,8 @@ class VpnSessionCoordinator(
                 locationCode = sessionSelection.locationCode.takeUnless { settings.advancedSettings.multiHop.enabled },
                 excludeLocationCode = sessionSelection.excludeLocationCode.takeUnless { settings.advancedSettings.multiHop.enabled },
                 profileCode = profileCode,
-                nodeId = sessionSelection.nodeId.takeUnless { settings.advancedSettings.multiHop.enabled },
-                multiHop = settings.advancedSettings.multiHop.takeIf { it.enabled },
+                nodeId = sessionSelection.nodeId,
+                multiHop = null,
             ) }
         }
         if (!session.canConnect) {

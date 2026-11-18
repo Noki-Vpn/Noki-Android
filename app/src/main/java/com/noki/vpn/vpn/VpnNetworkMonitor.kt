@@ -28,6 +28,8 @@ internal class VpnNetworkMonitor(
     private var startedEpoch = 0L
     private var activeCallbacks = 0
 
+    val isStarted: Boolean get() = lifecycleLock.withLock { startedEpoch != 0L }
+
     fun start(onObservation: (UnderlyingNetworkObservation<UnderlyingNetworkSnapshot>) -> Unit) {
         stop()
         val epoch = lifecycleLock.withLock {

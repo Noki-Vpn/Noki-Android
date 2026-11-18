@@ -177,7 +177,7 @@ internal class VpnConnectionOrchestrator(
     @Synchronized
     fun startCore(config: String): Boolean {
         val activeTunnel = tunnel ?: return false
-        return core.start(config, activeTunnel.fd)
+        return core.start(config, activeTunnel.fd, activeTunnel.routingRules)
     }
 
     fun stopCore() {
@@ -197,6 +197,9 @@ internal class VpnConnectionOrchestrator(
 
     fun prepareReadinessCandidates(targetUrls: List<String>, timeoutMillis: Long, watchdog: Boolean = false): VpnReadinessProbe =
         core.prepareReadinessCandidates(targetUrls, timeoutMillis, watchdog)
+
+    fun prepareEntryRoute(exitNodeId: String, generation: Long, enrollment: Boolean): VpnReadinessProbe =
+        core.prepareEntryRoute(exitNodeId, generation, enrollment)
 
     fun pauseConnectedSidecars() {
         activeOwner?.let(sidecars::stop)

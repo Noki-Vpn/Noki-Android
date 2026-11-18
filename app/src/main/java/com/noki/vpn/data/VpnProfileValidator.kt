@@ -38,12 +38,18 @@ object VpnProfileValidator {
         }
         val multiHop = profile.multiHop
         if (advancedSettings.multiHop.enabled) {
-            if (multiHop == null || multiHop.selection != advancedSettings.multiHop) return "multihop_runtime_missing"
+            if (multiHop == null || (multiHop.version != 3 && multiHop.selection != advancedSettings.multiHop)) {
+                return "multihop_runtime_missing"
+            }
             val hops = runCatching { multiHop.selection.explicitNodeIds() }.getOrNull()
-            if (multiHop.version != 2 || hops != (multiHop.entryNodeId to multiHop.exitNodeId) ||
-                !multiHop.policyHash.matches(Regex("[0-9a-f]{64}"))) return "multihop_policy_invalid"
-            if (profile.host != multiHop.entryIp || profile.host.isBlank() || profile.port.toIntOrNull() !in 20000..29999) {
-                return "multihop_entry_invalid"
+            if (hops != (multiHop.entryNodeId to multiHop.exitNodeId)) return "multihop_policy_invalid"
+            if (multiHop.version == 3) {
+                if (!profile.entryRoute || profile.proxyType.equals("nokinv", true)) return "entry_route_unavailable"
+            } else {
+                if (multiHop.version != 2 || !multiHop.policyHash.matches(Regex("[0-9a-f]{64}"))) return "multihop_policy_invalid"
+                if (profile.host != multiHop.entryIp || profile.host.isBlank() || profile.port.toIntOrNull() !in 20000..29999) {
+                    return "multihop_entry_invalid"
+                }
             }
         } else if (multiHop != null) return "multihop_runtime_unexpected"
         val expectedSecurity = advancedSettings.effectiveProtocol.name.lowercase(Locale.ROOT)

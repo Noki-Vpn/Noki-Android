@@ -9,7 +9,10 @@ internal sealed interface AppVpnRoutingRules {
         val allowedPackages: Set<String> = emptySet(),
         val disallowedPackages: Set<String> = emptySet(),
         override val removedPackages: Set<String> = emptySet(),
-    ) : AppVpnRoutingRules
+    ) : AppVpnRoutingRules {
+        val requiresOwnerCheck: Boolean
+            get() = allowedPackages.isNotEmpty() || disallowedPackages.size > 1
+    }
 
     data class Rejected(
         val failureReason: String,
@@ -19,6 +22,7 @@ internal sealed interface AppVpnRoutingRules {
 
 internal object AppVpnRoutingPolicy {
     const val EMPTY_ONLY_SELECTED_REASON = "empty_selected_apps"
+    const val OWNER_CHECK_UNAVAILABLE_REASON = "app_owner_check_unavailable"
 
     fun rules(
         appPackageName: String,

@@ -77,12 +77,10 @@ internal fun homeSelectedLocation(
 }
 
 internal fun homeMultiHopExitCountryCode(state: AppUiState): String? {
-    val usesRuCatalog = usesRuForeignNodeCatalog(state.advancedSettings.ruRelayEnabled, state.ruForeignNodes)
+    if (state.advancedSettings.ruRelayEnabled || !state.advancedSettings.multiHop.enabled) return null
     fun nodeCountry(nodeId: String?): String? {
         if (nodeId.isNullOrBlank()) return null
-        val code = if (usesRuCatalog) {
-            state.ruForeignNodes.firstOrNull { it.id == nodeId }?.countryCode
-        } else state.locations.asSequence().flatMap { it.servers.asSequence() }.firstOrNull {
+        val code = state.locations.asSequence().flatMap { it.servers.asSequence() }.firstOrNull {
             it.id == nodeId || it.locationCode.equals(nodeId, true)
         }?.countryCode
         return code?.let(::countryMarkerCode)
@@ -97,9 +95,9 @@ internal fun homeMultiHopExitCountryCode(state: AppUiState): String? {
     val runtimeCode = state.userProfile.selectedServerCode
     // Runtime UI sync is asynchronous; a previous Auto id cannot confirm another exit.
     val matchesExit = when (exit?.kind) {
-        ServerSelectionMode.SERVER -> runtimeCode == exit.nodeId || (!usesRuCatalog && state.locations.any { location ->
+        ServerSelectionMode.SERVER -> runtimeCode == exit.nodeId || state.locations.any { location ->
             location.servers.any { it.id == exit.nodeId && it.locationCode.equals(runtimeCode, true) }
-        })
+        }
         ServerSelectionMode.COUNTRY -> nodeCountry(runtimeCode) == configuredCountry
         else -> false
     }
@@ -124,15 +122,15 @@ internal fun homeServerSubtitle(state: AppUiState): String? {
         ServerSelectionMode.SERVER -> nodeName(selection.nodeId) ?: unavailable
         else -> tr(language, "Не выбран", "Not selected")
     }
-    val multiHop = state.advancedSettings.multiHop
-    if (!multiHop.enabled && state.userProfile.serverSelectionMode == ServerSelectionMode.AUTO &&
+    val multiHop = state.advancedSettings.multiHop.takeIf { !ruRelay && it.enabled }
+    if (multiHop == null && state.userProfile.serverSelectionMode == ServerSelectionMode.AUTO &&
         state.connectionState != VpnConnectionState.CONNECTED) {
         return if (ruRelay) tr(language, "RU-реле", "RU relay") else null
     }
     val destination = when {
         ruRelay && state.connectionState == VpnConnectionState.CONNECTED ->
             state.ruForeignNodes.firstOrNull { it.id == state.userProfile.selectedServerCode }?.name ?: unavailable
-        multiHop.enabled -> hopLabel(multiHop.exit)
+        multiHop != null -> hopLabel(multiHop.exit)
         state.userProfile.serverSelectionMode == ServerSelectionMode.AUTO ->
             if (ruRelay) tr(language, "Автовыбор", "Automatic") else selectedLocation?.country
         state.userProfile.serverSelectionMode == ServerSelectionMode.SERVER ->
@@ -144,7 +142,7 @@ internal fun homeServerSubtitle(state: AppUiState): String? {
         ruRelay -> countryName(state.userProfile.selectedCountryCode) ?: unavailable
         else -> null
     }
-    val route = if (multiHop.enabled) "${hopLabel(multiHop.entry)} → $destination" else destination
+    val route = if (multiHop != null) "${hopLabel(multiHop.entry)} → $destination" else destination
     return if (ruRelay) "${tr(language, "RU-реле", "RU relay")} → $route" else route
 }
 

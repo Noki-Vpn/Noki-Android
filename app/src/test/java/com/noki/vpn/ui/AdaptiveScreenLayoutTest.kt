@@ -843,7 +843,18 @@ class AdaptiveScreenLayoutTest {
     )
 
     @Test
-    fun multiHopSharedControlsSaveDistinctNodesWithRuWithoutConfirmation() = saveMultiHopPair(ruRelayEnabled = true)
+    fun multiHopEditorIsUnavailableWhileRuRelayIsEnabled() {
+        val normal = russianState()
+        val state = normal.copy(advancedSettings = normal.advancedSettings.copy(ruRelayEnabled = true))
+        val viewModel = layoutViewModel()
+        render {
+            MultiHopScreen(state, viewModel, rememberPrismalGlassLayer(),
+                liveGlassEnabled = false, showBackground = false)
+        }.use {
+            compose.onNodeWithText("Выключите RU-реле, чтобы включить MultiHop.").assertIsDisplayed()
+            compose.onNodeWithText("Сохранить").assertDoesNotExist()
+        }
+    }
 
     @Test
     fun multiHopSharedControlsSaveDistinctNodesWithoutEnablingRu() = saveMultiHopPair(ruRelayEnabled = false)
@@ -1052,7 +1063,7 @@ class AdaptiveScreenLayoutTest {
     @Test fun bypassRulesScale() = checkRules(SiteRulesMode.BYPASS, "rules-bypass-wide")
     @Test
     @Config(qualifiers = "w360dp-h800dp-xxhdpi")
-    fun russianResourcesRuleFitsAndShowsOnState() {
+    fun russianResourcesRuleFitsAndExplainsPermanentDirectRouting() {
         val viewModel = layoutViewModel()
         val state = russianState().let { current ->
             current.copy(advancedSettings = current.advancedSettings.copy(
@@ -1065,7 +1076,7 @@ class AdaptiveScreenLayoutTest {
             compose.onNodeWithText("Российские ресурсы", useUnmergedTree = true)
                 .performSemanticsAction(androidx.compose.ui.semantics.SemanticsActions.GetTextLayoutResult) { it(layouts) }
             assertFalse("Russian resources label must fit", layouts.single().isLineEllipsized(0))
-            compose.onNodeWithText("on").assertIsDisplayed()
+            compose.onNodeWithText("Всегда напрямую").assertIsDisplayed()
             compose.onNodeWithText("Изм.").assertDoesNotExist()
             saveImage("rules-bypass-on-narrow")
         }

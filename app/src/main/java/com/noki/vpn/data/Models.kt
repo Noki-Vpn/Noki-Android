@@ -190,7 +190,11 @@ data class VlessProfile(
     val shortId: String = "",
     val spiderX: String = "/",
     val multiHop: BackendMultiHopSession? = null,
-)
+    val entryRoute: Boolean = false,
+    val entryRouteExpiresAt: Long? = null,
+) {
+    internal fun entryRouteExit(): String? = if (entryRoute) multiHop?.exitNodeId.orEmpty() else null
+}
 
 data class VpnEndpointOption(
     val code: String = "",
@@ -385,6 +389,8 @@ data class VpnServer(
     val latencyMs: Int? = null,
     val multiHopEntryAvailable: Boolean = false,
     val multiHopExitAvailable: Boolean = false,
+    val probeHost: String? = null,
+    val probeIp: String? = null,
 )
 
 @Immutable

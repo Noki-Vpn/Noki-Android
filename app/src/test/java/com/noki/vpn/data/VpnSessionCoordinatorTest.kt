@@ -58,43 +58,43 @@ class VpnSessionCoordinatorTest {
         assertEquals(9443, outbound.getInt("server_port"))
     }
     @Test
-    fun `serialized no RU MultiHop keeps Auto ranking and explicit NokiNV QUIC through the entry`() = runBlocking {
-        val payload = contractFixture("multihop_session_v2.json")
-        for (side in listOf("entry", "exit")) {
-            payload.getJSONObject("multihop").getJSONObject("selection").getJSONObject(side)
-                .put("country_code", org.json.JSONObject.NULL)
-        }
-        val candidates = payload.getJSONArray("endpoint_candidates")
-        candidates.put(org.json.JSONObject(candidates.getJSONObject(2).toString())
-            .put("code", "lv-nokinv").put("proxy_type", "nokinv").put("security", "tls")
-            .put("transport", "nokinv").put("transport_mode", org.json.JSONObject.NULL).put("entry_port", 20004)
-            .put("public_key", org.json.JSONObject.NULL).put("short_id", org.json.JSONObject.NULL).put("flow", ""))
-        payload.put("nokinv_token", java.util.Base64.getUrlEncoder().withoutPadding().encodeToString(ByteArray(32) { 5 }))
-            .put("nokinv_credential_generation", 1)
-        val session = BackendVpnSessionJsonParser.parse(payload)
+    fun `MultiHop Auto uses the ordinary entry and excludes NokiNV from the local route`() = runBlocking {
+        val legacy = BackendVpnSessionJsonParser.parse(contractFixture("multihop_session_v2.json"))
+        val route = checkNotNull(legacy.multiHop)
+        val entry = VpnServer(route.entryNodeId, "Entry", "DE", "de-2", "entry.example", null, true, multiHopEntryAvailable = true)
+        val exit = VpnServer(route.exitNodeId, "Exit", "LV", "lv2", "exit.example", null, true, multiHopExitAvailable = true)
+        val vless = legacy.endpointCandidates.first { it.transport == "xhttp" }.copy(
+            nodeId = entry.id, entryHost = entry.host, connectIp = "203.0.113.10", entryPort = 443,
+            locationCode = entry.locationCode,
+        )
+        val nokinv = vless.copy(code = "entry-nokinv", proxyType = "nokinv", security = "tls", transport = "nokinv",
+            transportMode = null, publicKey = null, shortId = null, flow = null)
+        val session = legacy.copy(multiHop = null, entryRoute = true, locationCode = entry.locationCode,
+            endpointCandidates = listOf(vless, nokinv),
+            nokinvToken = java.util.Base64.getUrlEncoder().withoutPadding().encodeToString(ByteArray(32) { 5 }),
+            nokinvCredentialGeneration = 1)
+        val api = FakeVpnSessionApi(pairSession = session, extraServers = listOf(entry, exit))
         val coordinator = VpnSessionCoordinator(context = RuntimeEnvironment.getApplication(),
-            repository = FakeVpnSessionStore(), backendApi = FakeVpnSessionApi(pairSession = session),
-            challengeSigner = { "signature" })
-        for (mode in listOf("", "quic")) {
-            val advanced = AdvancedSettings(ruRelayEnabled = false, multiHop = session.multiHop!!.selection,
-                protocol = if (mode.isEmpty()) VpnProtocol.AUTO else VpnProtocol.NOKINV,
-                endpointSelectionMode = if (mode.isEmpty()) EndpointSelectionMode.AUTO else EndpointSelectionMode.MANUAL,
-                manualEndpointGroupKey = if (mode.isEmpty()) "" else "tls|nokinv|$mode")
-            val settings = DefaultStoredSettingsFactory.create().copy(backendDeviceId = "device-id", backendDeviceKey = "device-key",
-                advancedSettings = advanced)
-            val result = coordinator.prepare("token", settings)
-            assertNull(VpnProfileValidator.rejectionReason(result.settings))
-            assertEquals(if (mode.isEmpty()) "vless" else "nokinv", result.settings.profile.proxyType)
-            assertEquals(if (mode.isEmpty()) "stream-up" else mode, result.settings.profile.transportMode)
-            assertEquals(if (mode.isEmpty()) "" else session.nokinvToken, result.settings.profile.nokinvToken)
-            val config = org.json.JSONObject(com.noki.vpn.vpn.VpnConfigFactory.build(result.settings.profile, advanced,
-                com.noki.vpn.vpn.GeositeAssetTest.asset("CATEGORY-RU" to listOf(
-                    com.noki.vpn.vpn.GeositeAssetTest.domain(2, "russian.example")))))
-            val outbound = config.getJSONArray("outbounds").getJSONObject(0)
-            assertEquals(session.multiHop.entryIp, outbound.getString("server"))
-            val selected = session.endpointCandidates.single { it.code == result.settings.profile.endpointCode }
-            assertEquals(selected.entryPort, outbound.getInt("server_port"))
-        }
+            repository = FakeVpnSessionStore(), backendApi = api, challengeSigner = { "signature" })
+        val advanced = AdvancedSettings(ruRelayEnabled = false, multiHop = route.selection)
+        val settings = DefaultStoredSettingsFactory.create().copy(backendDeviceId = "device-id", backendDeviceKey = "device-key",
+            advancedSettings = advanced)
+        val result = coordinator.prepare("token", settings)
+        assertNull(VpnProfileValidator.rejectionReason(result.settings))
+        assertEquals(entry.id, api.nodeId)
+        assertNull(api.multiHopRequest)
+        assertEquals(listOf(vless.code), result.session.endpointCandidates.map { it.code })
+        assertEquals(exit.id, result.settings.profile.entryRouteExit())
+        assertEquals("", result.settings.profile.nokinvToken)
+        val config = org.json.JSONObject(com.noki.vpn.vpn.VpnConfigFactory.build(result.settings.profile, advanced,
+            com.noki.vpn.vpn.GeositeAssetTest.snapshot("CATEGORY-RU" to listOf(
+                com.noki.vpn.vpn.GeositeAssetTest.domain(2, "russian.example")))))
+        val outbound = config.getJSONArray("outbounds").getJSONObject(0)
+        assertEquals("203.0.113.10", outbound.getString("server"))
+        assertEquals(443, outbound.getInt("server_port"))
+        val unsupported = advanced.copy(protocol = VpnProtocol.NOKINV, endpointSelectionMode = EndpointSelectionMode.MANUAL,
+            manualEndpointGroupKey = EndpointGroupPolicy.groupKey(nokinv))
+        assertTrue(runCatching { coordinator.prepare("token", settings.copy(advancedSettings = unsupported)) }.isFailure)
     }
 
     @Test
@@ -243,12 +243,45 @@ class VpnSessionCoordinatorTest {
         Unit
     }
 
+    @Test fun `persisted country MultiHop samples only allowed country nodes in one batch and preserves the explicit exit`() = runBlocking {
+        val slow = "11111111-1111-4111-8111-111111111111"
+        val fast = "22222222-2222-4222-8222-222222222222"
+        val exit = "33333333-3333-4333-8333-333333333333"
+        val route = MultiHopSettings(true, HopSelection(ServerSelectionMode.COUNTRY, countryCode = "DE"),
+            HopSelection(ServerSelectionMode.SERVER, nodeId = exit))
+        val api = FakeVpnSessionApi(sessionError = BackendException("pending", 503), extraServers = listOf(
+            VpnServer(slow, "Slow", "DE", "de-2", "slow.example", 25001, true, multiHopEntryAvailable = true),
+            VpnServer(fast, "Fast", "DE", "de-2", "fast.example", 25002, true, multiHopEntryAvailable = true),
+            VpnServer(exit, "Exit", "LV", "lv2", "exit.example", null, true, multiHopExitAvailable = true),
+            VpnServer("44444444-4444-4444-8444-444444444444", "Foreign", "FR", "lv2", "foreign.example", 25003, true, multiHopEntryAvailable = true)))
+        var batches = 0
+        val coordinator = VpnSessionCoordinator(context = RuntimeEnvironment.getApplication(), repository = FakeVpnSessionStore(),
+            backendApi = api, challengeSigner = { "signature" }, measureClientLatencies = { locations ->
+                batches++
+                val nodes = locations.flatMap { it.servers }
+                assertEquals(setOf(slow, fast), nodes.map { it.id }.toSet())
+                nodes.associate { checkNotNull(clientLatencyTargetKey(it)) to if (it.id == fast) 20 else 180 }
+            })
+        val settings = DefaultStoredSettingsFactory.create().copy(backendDeviceId = "device-id", backendDeviceKey = "device-key",
+            advancedSettings = AdvancedSettings(ruRelayEnabled = false, multiHop = route))
+        assertTrue(runCatching { coordinator.prepare("token", settings) }.exceptionOrNull() is BackendException)
+        assertEquals(1, batches)
+        assertEquals(fast, api.nodeId)
+        assertEquals(route, settings.advancedSettings.multiHop)
+    }
+
     @Test
-    fun `no RU MultiHop forwards pair once without catalog precheck or direct retry`() = runBlocking {
+    fun `ordinary MultiHop provisions the selected entry without sending an exit to the backend`() = runBlocking {
         val selection = MultiHopSettings(true,
             HopSelection(ServerSelectionMode.SERVER, nodeId = "00000000-0000-0000-0000-000000000001"),
             HopSelection(ServerSelectionMode.SERVER, nodeId = "00000000-0000-0000-0000-000000000002"))
-        val api = FakeVpnSessionApi(sessionError = BackendException("route pending", 503))
+        val entryId = checkNotNull(selection.entry?.nodeId)
+        val exitId = checkNotNull(selection.exit?.nodeId)
+        val api = FakeVpnSessionApi(sessionError = BackendException("route pending", 503),
+            extraServers = listOf(
+                VpnServer(entryId, "Entry", "DE", "de-2", "entry.example", null, true, multiHopEntryAvailable = true),
+                VpnServer(exitId, "Exit", "LV", "lv2", "exit.example", null, true, multiHopExitAvailable = true),
+            ))
         var prechecks = 0
         val coordinator = VpnSessionCoordinator(context = RuntimeEnvironment.getApplication(),
             repository = FakeVpnSessionStore(), backendApi = api,
@@ -256,39 +289,46 @@ class VpnSessionCoordinatorTest {
         val settings = DefaultStoredSettingsFactory.create().copy(backendDeviceId = "device-id", backendDeviceKey = "device-key",
             advancedSettings = AdvancedSettings(ruRelayEnabled = false, multiHop = selection, protocol = VpnProtocol.TLS))
         assertTrue(runCatching { coordinator.prepare("token", settings) }.exceptionOrNull() is BackendException)
-        assertEquals(0, api.catalogRequests)
+        assertEquals(2, api.catalogRequests)
         assertEquals(0, prechecks)
-        assertEquals(selection, api.multiHopRequest)
+        assertNull(api.multiHopRequest)
         assertNull(api.countryCode)
         assertNull(api.locationCode)
-        assertNull(api.nodeId)
+        assertEquals(entryId, api.nodeId)
         assertEquals(1, api.requests.size)
         Unit
     }
 
     @Test
     fun `no RU pair honors manual protocol and never falls back to a different transport`() = runBlocking {
-        val session = BackendVpnSessionJsonParser.parse(contractFixture("multihop_session_v2.json"))
+        val legacy = BackendVpnSessionJsonParser.parse(contractFixture("multihop_session_v2.json"))
+        val route = checkNotNull(legacy.multiHop)
+        val entry = VpnServer(route.entryNodeId, "Entry", "DE", "de-2", "entry.example", null, true, multiHopEntryAvailable = true)
+        val exit = VpnServer(route.exitNodeId, "Exit", "LV", "lv2", "exit.example", null, true, multiHopExitAvailable = true)
+        val session = legacy.copy(multiHop = null, entryRoute = true, locationCode = entry.locationCode,
+            endpointCandidates = legacy.endpointCandidates.map {
+                it.copy(nodeId = entry.id, entryHost = "entry.example", connectIp = "203.0.113.10", entryPort = 443, locationCode = entry.locationCode)
+            })
         for (candidate in session.endpointCandidates.filter { it.transport == "xhttp" || it.proxyType == "hysteria" }) {
             val protocol = VpnProtocol.fromBackendCode(candidate.security, candidate.proxyType)
-            val api = FakeVpnSessionApi(pairSession = session)
+            val api = FakeVpnSessionApi(pairSession = session, extraServers = listOf(entry, exit))
             val coordinator = VpnSessionCoordinator(context = RuntimeEnvironment.getApplication(), repository = FakeVpnSessionStore(),
                 backendApi = api, challengeSigner = { "signature" })
             val settings = DefaultStoredSettingsFactory.create().copy(backendDeviceId = "device-id", backendDeviceKey = "device-key",
-                advancedSettings = AdvancedSettings(ruRelayEnabled = false, multiHop = session.multiHop!!.selection,
+                advancedSettings = AdvancedSettings(ruRelayEnabled = false, multiHop = route.selection,
                     protocol = protocol, endpointSelectionMode = EndpointSelectionMode.MANUAL, manualEndpointCode = "old-direct",
                     manualEndpointGroupKey = EndpointGroupPolicy.groupKey(candidate)))
             val result = coordinator.prepare("token", settings)
             assertEquals(candidate.code, result.settings.profile.endpointCode)
             assertTrue(VpnProfileValidator.isUsable(result.settings.profile, result.settings.advancedSettings))
-            assertEquals(session.multiHop, result.settings.profile.multiHop)
-            assertEquals(session.multiHop.entryIp, result.settings.profile.host)
+            assertEquals(route.exitNodeId, result.settings.profile.entryRouteExit())
+            assertEquals("443", result.settings.profile.port)
             assertEquals(settings.advancedSettings.manualEndpointGroupKey, result.settings.advancedSettings.manualEndpointGroupKey)
             assertEquals(candidate.code, result.settings.advancedSettings.manualEndpointCode)
             assertEquals(protocol, result.settings.advancedSettings.effectiveProtocol)
             assertEquals(protocol, result.settings.advancedSettings.copy(multiHop = MultiHopSettings()).effectiveProtocol)
             assertEquals(VpnProtocol.WIREGUARD, result.settings.advancedSettings.copy(ruRelayEnabled = true).effectiveProtocol)
-            assertEquals(0, api.catalogRequests)
+            assertEquals(2, api.catalogRequests)
             val unsupported = settings.copy(advancedSettings = settings.advancedSettings.copy(protocol = VpnProtocol.WIREGUARD))
             assertTrue(runCatching { coordinator.prepare("token", unsupported) }.isFailure)
             val absent = settings.copy(advancedSettings = settings.advancedSettings.copy(manualEndpointGroupKey = "tls|nokinv|tcp"))

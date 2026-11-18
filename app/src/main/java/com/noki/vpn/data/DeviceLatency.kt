@@ -84,6 +84,22 @@ object DeviceLatency {
         return parsePingAverageMs(output)
     }
 
+    internal fun measureIcmpOnInterface(
+        rawIp: String,
+        interfaceName: String,
+        runCommand: (List<String>, Long) -> String? = ::runPingProcess,
+    ): Int? {
+        val ip = rawIp.trim()
+        val octets = ip.split('.')
+        val ipv4 = octets.size == 4 && octets.all { part ->
+            part.isNotEmpty() && part.all(Char::isDigit) && part.toIntOrNull()?.let { it in 0..255 } == true
+        }
+        val ipv6 = ':' in ip && ip.all { it in "0123456789abcdefABCDEF:." } &&
+            runCatching { InetAddress.getByName(ip) is java.net.Inet6Address }.getOrDefault(false)
+        if ((!ipv4 && !ipv6) || interfaceName.isBlank() || interfaceName.any { it.isWhitespace() }) return null
+        return runPing(ip, 1, 1, interfaceName, runCommand)?.let(::parsePingAverageMs)
+    }
+
     fun normalizeHost(rawHost: String): String? {
         var host = rawHost.trim()
         if (host.isBlank()) return null
@@ -163,11 +179,12 @@ object DeviceLatency {
         }
     }
 
-    private fun runPing(address: String, count: Int, timeoutSeconds: Int): String? {
+    private fun runPing(address: String, count: Int, timeoutSeconds: Int,
+        interfaceName: String? = null, runCommand: (List<String>, Long) -> String? = ::runPingProcess): String? {
         val safeCount = count.coerceIn(1, 5)
         val safeTimeout = timeoutSeconds.coerceIn(1, 5)
-        return runPingCommand("/system/bin/ping", address, safeCount, safeTimeout)
-            ?: runPingCommand("ping", address, safeCount, safeTimeout)
+        return runPingCommand("/system/bin/ping", address, safeCount, safeTimeout, interfaceName, runCommand)
+            ?: runPingCommand("ping", address, safeCount, safeTimeout, interfaceName, runCommand)
     }
 
     private fun runPingCommand(
@@ -175,21 +192,22 @@ object DeviceLatency {
         address: String,
         count: Int,
         timeoutSeconds: Int,
-    ): String? {
+        interfaceName: String?,
+        runCommand: (List<String>, Long) -> String?,
+    ): String? = runCommand(buildList {
+        add(command)
+        if (interfaceName != null) { add("-I"); add(interfaceName) }
+        addAll(listOf("-c", count.toString(), "-W", timeoutSeconds.toString(), address))
+    }, (count * timeoutSeconds + 3).toLong())
+
+    private fun runPingProcess(arguments: List<String>, timeoutSeconds: Long): String? {
         var process: Process? = null
         return try {
-            process = ProcessBuilder(
-                command,
-                "-c",
-                count.toString(),
-                "-W",
-                timeoutSeconds.toString(),
-                address,
-            )
+            process = ProcessBuilder(arguments)
                 .redirectErrorStream(true)
                 .start()
-            val finished = process.waitFor((count * timeoutSeconds + 3).toLong(), TimeUnit.SECONDS)
-            if (!finished) return null
+            val finished = process.waitFor(timeoutSeconds, TimeUnit.SECONDS)
+            if (!finished || process.exitValue() != 0) return null
             val output = process.inputStream.bufferedReader().use { reader ->
                 buildString {
                     val buffer = CharArray(1024)

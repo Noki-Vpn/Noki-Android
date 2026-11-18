@@ -20,7 +20,7 @@ import org.junit.Test
 class AdvancedSettingsStateReducerTest {
     @Test
     fun gamingOverridesRuAndManualChoiceWithoutReplacingItAndKeepsMultiHop() {
-        val saved = AdvancedSettings(protocol = VpnProtocol.REALITY, ruRelayEnabled = true,
+        val saved = AdvancedSettings(protocol = VpnProtocol.REALITY, ruRelayEnabled = false,
             endpointSelectionMode = EndpointSelectionMode.MANUAL, manualEndpointCode = "xhttp",
             manualEndpointGroupKey = "reality|xhttp|stream-up", multiHop = MultiHopSettings(enabled = true))
         val current = AppUiState(advancedSettings = saved,
@@ -51,7 +51,7 @@ class AdvancedSettingsStateReducerTest {
     }
 
     @Test
-    fun ruRelayToggleKeepsExplicitMultiHopAndInvalidatesBothPreviousRuntimes() {
+    fun ruRelayDisablesMultiHopButKeepsItsPairForManualReenable() {
         val manual = MultiHopSettings(enabled = true,
             entry = HopSelection(ServerSelectionMode.SERVER, nodeId = "foreign-entry"),
             exit = HopSelection(ServerSelectionMode.SERVER, nodeId = "foreign-exit"))
@@ -67,15 +67,14 @@ class AdvancedSettingsStateReducerTest {
         val enabled = AdvancedSettingsStateReducer.setRuRelayEnabled(current, true)
         assertEquals(VpnProtocol.WIREGUARD, enabled.advancedSettings.effectiveProtocol)
         assertEquals(VpnProtocol.REALITY, enabled.advancedSettings.protocol)
-        assertEquals(true, enabled.advancedSettings.multiHop.enabled)
-        assertEquals(manual.entry, enabled.advancedSettings.multiHop.entry)
+        assertEquals(manual.copy(enabled = false), enabled.advancedSettings.multiHop)
         assertEquals("", enabled.profile.uuid)
         assertEquals("", enabled.profile.endpointCode)
 
         val disabled = AdvancedSettingsStateReducer.setRuRelayEnabled(enabled, false)
         assertEquals(VpnProtocol.REALITY, disabled.advancedSettings.effectiveProtocol)
-        assertEquals(true, disabled.advancedSettings.multiHop.enabled)
-        assertEquals(manual.entry, disabled.advancedSettings.multiHop.entry)
+        assertEquals(manual.copy(enabled = false), disabled.advancedSettings.multiHop)
+        assertEquals(manual, AdvancedSettingsStateReducer.setMultiHop(disabled, manual).advancedSettings.multiHop)
         assertEquals("", disabled.profile.uuid)
     }
 
@@ -104,8 +103,8 @@ class AdvancedSettingsStateReducerTest {
         assertEquals("saved-group", next.advancedSettings.manualEndpointGroupKey)
         assertEquals(current.advancedSettings.alwaysOnDomains, next.advancedSettings.alwaysOnDomains)
         assertEquals("", next.profile.uuid)
-        assertEquals(true, AdvancedSettingsStateReducer.setMultiHop(current.copy(
-            advancedSettings = current.advancedSettings.copy(ruRelayEnabled = true)), selected).advancedSettings.ruRelayEnabled)
+        val ru = current.copy(advancedSettings = current.advancedSettings.copy(ruRelayEnabled = true))
+        assertSame(ru, AdvancedSettingsStateReducer.setMultiHop(ru, selected))
     }
 
     @Test

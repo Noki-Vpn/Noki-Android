@@ -23,7 +23,9 @@ object AdvancedSettingsStateReducer {
         enabled: Boolean,
     ): AppUiState {
         val advanced = current.advancedSettings
-        val nextAdvanced = advanced.copy(
+        val nextAdvanced = RuntimeProfilePolicy.normalizeRouteModes(
+            advanced.copy(ruRelayEnabled = advanced.ruRelayEnabled || enabled),
+        ).copy(
             ruRelayEnabled = enabled,
             gamingModeEnabled = advanced.gamingModeEnabled && !enabled,
         )
@@ -35,6 +37,7 @@ object AdvancedSettingsStateReducer {
     }
 
     fun setMultiHop(current: AppUiState, settings: MultiHopSettings): AppUiState {
+        if (current.advancedSettings.ruRelayEnabled) return current
         val nextAdvanced = current.advancedSettings.copy(
             multiHop = settings,
         )
@@ -47,7 +50,7 @@ object AdvancedSettingsStateReducer {
 
     fun setGamingModeEnabled(current: AppUiState, enabled: Boolean): AppUiState {
         val advanced = current.advancedSettings
-        val nextAdvanced = advanced.copy(
+        val nextAdvanced = RuntimeProfilePolicy.normalizeRouteModes(advanced).copy(
             gamingModeEnabled = enabled,
             ruRelayEnabled = advanced.ruRelayEnabled && !enabled,
         )

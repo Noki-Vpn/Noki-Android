@@ -375,7 +375,14 @@ object AppErrorMapper {
                 language, "RU-реле подключено, но выходная нода недоступна",
                 "RU relay connected, but the exit node is unreachable",
             )
+            "ru_multihop_conflict" -> com.noki.vpn.ui.multiHopUnavailableText(language)
+            "entry_route_unavailable" -> tr(language, "Выбранный маршрут недоступен", "The selected route is unavailable")
+            "entry_route_not_confirmed" -> tr(language, "Входная нода не подтвердила маршрут", "The entry node did not confirm the route")
             "rules_error" -> tr(language, "Не удалось применить правила приложений", "Failed to apply app rules")
+            "app_owner_check_unavailable" -> tr(
+                language, "Фильтр по приложениям требует Android 10 или новее",
+                "App filtering requires Android 10 or later",
+            )
             "temporary_vpn_limit" -> tr(
                 language,
                 "Лимит временных подключений исчерпан",
@@ -413,7 +420,9 @@ object AppErrorMapper {
             "ru_wireguard_exit_probe_failed" -> tr(
                 language, "Нет связи с выходом", "Exit unreachable",
             )
+            "ru_multihop_conflict" -> readableVpnError(language, reason)
             "rules_error" -> tr(language, "Ошибка правил", "Rules error")
+            "app_owner_check_unavailable" -> readableVpnError(language, reason)
             else -> reason
         }
     }

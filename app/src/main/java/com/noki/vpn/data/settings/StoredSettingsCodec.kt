@@ -9,27 +9,34 @@ internal class StoredSettingsCodec(
     fun decode(raw: String?, persistMigration: ((StoredSettings) -> Unit)? = null): StoredSettings {
         if (raw.isNullOrBlank()) return defaults()
         val json = runCatching { JSONObject(raw) }.getOrElse { return defaults() }
+        val resetLegacyRuDefault = json.optInt("ruRelayDefaultsVersion") < 3
+        var routeSelectionMigrated = false
         val migrated = runCatching {
             val decoded = decode(json).let { settings ->
-                if (json.optInt("ruRelayDefaultsVersion") >= 3) settings else settings.copy(
+                val explicitConflict = json.optBoolean("ruRelayEnabled") && settings.advancedSettings.multiHop.enabled
+                if (!resetLegacyRuDefault || explicitConflict) settings else settings.copy(
                     advancedSettings = settings.advancedSettings.copy(ruRelayEnabled = false),
                     profile = RuntimeProfilePolicy.profileAfterServerSelection(settings.profile),
                     ruRelaySelectionRevision = settings.ruRelaySelectionRevision + 1L,
                 )
             }
-            val permitted = decoded.copy(advancedSettings = RuntimeProfilePolicy.normalizeAdvancedSettings(decoded.advancedSettings, decoded.userProfile))
+            val selected = RuntimeProfilePolicy.normalizeRouteSelection(decoded)
+            routeSelectionMigrated = selected != decoded
+            val permitted = selected.copy(advancedSettings = RuntimeProfilePolicy.normalizeAdvancedSettings(selected.advancedSettings, selected.userProfile))
             val stored = if (json.has("youtubeCascade") && !json.isNull("youtubeCascade")) permitted.copy(
-                profile = RuntimeProfilePolicy.profileAfterServerSelection(decoded.profile),
+                profile = RuntimeProfilePolicy.profileAfterServerSelection(permitted.profile),
             ) else permitted
             if (json.optInt("russianDirectDefaultsVersion") >= 1) stored else stored.copy(selectedPackages = DefaultStoredSettingsFactory.updatedDefaultPackages(
                 stored.selectedPackages, stored.filterMode,
             ))
         }.getOrElse { return defaults() }
-        if (json.optInt("ruRelayDefaultsVersion") < 3) persistMigration?.invoke(migrated)
+        if (resetLegacyRuDefault || routeSelectionMigrated) persistMigration?.invoke(migrated)
         return migrated
     }
 
-    fun encode(settings: StoredSettings): String = JSONObject()
+    fun encode(settings: StoredSettings): String = encodeNormalized(RuntimeProfilePolicy.normalizeRouteSelection(settings))
+
+    private fun encodeNormalized(settings: StoredSettings): String = JSONObject()
         .put("russianDirectDefaultsVersion", 1)
         .put("ruRelayDefaultsVersion", 3)
         .put("remark", settings.profile.remark)
@@ -56,6 +63,8 @@ internal class StoredSettingsCodec(
         .put("publicKey", settings.profile.publicKey)
         .put("shortId", settings.profile.shortId)
         .put("spiderX", settings.profile.spiderX)
+        .put("entryRoute", settings.profile.entryRoute)
+        .put("entryRouteExpiresAt", settings.profile.entryRouteExpiresAt)
         .put("multiHopRuntime", settings.profile.multiHop?.let { route -> JSONObject()
             .put("version", route.version).put("selection", encodeMultiHopSettings(route.selection))
             .put("entryNodeId", route.entryNodeId).put("exitNodeId", route.exitNodeId)
@@ -155,6 +164,8 @@ internal class StoredSettingsCodec(
             publicKey = json.optString("publicKey"),
             shortId = json.optString("shortId"),
             spiderX = json.optString("spiderX", "/"),
+            entryRoute = json.optBoolean("entryRoute"),
+            entryRouteExpiresAt = json.optLong("entryRouteExpiresAt").takeIf { it > 0 },
             multiHop = json.optJSONObject("multiHopRuntime")?.let { route -> BackendMultiHopSession(
                 selection = decodeMultiHopSettings(route.getJSONObject("selection")),
                 entryNodeId = route.getString("entryNodeId"), exitNodeId = route.getString("exitNodeId"),

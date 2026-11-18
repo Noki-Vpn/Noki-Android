@@ -4,6 +4,17 @@ import org.junit.Assert.assertEquals
 import org.junit.Test
 
 class EndpointRankingPolicyTest {
+    @Test fun catalogPrefersSelectionWeightAndRetainsLegacyDynamicBandwidthWhenAbsent() {
+        val location = org.json.JSONObject("""{"id":"lv","code":"lv","name":"LV","entry_host":"vpn.example","country_code":"LV",
+            "servers":[{"id":"node","name":"Node","country_code":"LV","location_code":"lv","host":"vpn.example",
+            "is_online":true,"probe_port":443,"weight":999,"selection_weight":2,"metrics_at":"1970-01-01T00:00:00Z"}]}""")
+        assertEquals(2, location.toBackendLocation().servers.single().weight)
+        location.getJSONArray("servers").getJSONObject(0).remove("selection_weight")
+        assertEquals(999, location.toBackendLocation().servers.single().weight)
+        location.getJSONArray("servers").getJSONObject(0).put("weight", 0)
+        assertEquals(0, location.toBackendLocation().servers.single().weight)
+    }
+
     @Test fun naiveHasAnIndependentAllowedAutoAndManualFamily() {
         val endpoint = tcpCandidate("naive").copy(proxyType = "naive", transport = "naive", security = "tls",
             transportMode = null, publicKey = null, shortId = null, flow = null, path = null)

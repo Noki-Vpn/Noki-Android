@@ -1,7 +1,6 @@
 package com.noki.vpn.vpn
 
 import android.content.Context
-import android.net.Network
 import androidx.work.BackoffPolicy
 import androidx.work.Constraints
 import androidx.work.CoroutineWorker
@@ -13,54 +12,43 @@ import androidx.work.WorkerParameters
 import com.noki.vpn.data.AndroidDeviceInfo
 import com.noki.vpn.data.BackendApiClient
 import com.noki.vpn.data.BackendRuWireGuardSession
+import com.noki.vpn.data.RuEntryCredential
+import com.noki.vpn.data.RuWireGuardSessionJsonParser
 import com.noki.vpn.data.DeviceIdentity
-import com.noki.vpn.data.DeviceLatency
 import com.noki.vpn.data.BackendException
 import com.noki.vpn.data.PendingRuWireGuardRevoke
-import com.noki.vpn.data.RuRelayCatalog
-import com.noki.vpn.data.RuRelayCatalogEntry
-import com.noki.vpn.data.RuRelayRttSample
-import com.noki.vpn.data.RuRelaySelection
-import com.noki.vpn.data.RuWireGuardSessionRequest
 import com.noki.vpn.data.ServerSelectionMode
 import com.noki.vpn.data.SettingsRepository
 import com.noki.vpn.data.StoredSettings
 import com.noki.vpn.data.RuForeignNode
 import com.noki.vpn.data.WireGuardKeyStore
-import java.util.UUID
-import kotlinx.coroutines.Dispatchers
+import com.noki.vpn.data.ClientLatencySampler
+import com.noki.vpn.data.EndpointRankingPolicy
 import kotlinx.coroutines.CancellationException
-import kotlinx.coroutines.async
-import kotlinx.coroutines.awaitAll
-import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.delay
-import kotlinx.coroutines.runInterruptible
-import kotlinx.coroutines.sync.Semaphore
-import kotlinx.coroutines.sync.withPermit
 import kotlinx.coroutines.withTimeoutOrNull
 import java.util.concurrent.TimeUnit
 
 internal data class PreparedRuWireGuardConnection(
-    val session: BackendRuWireGuardSession.Ready,
+    val credential: RuEntryCredential,
     val privateKey: ByteArray,
     val exitNode: RuForeignNode,
+    val enrolled: Boolean = false,
 )
 
-/** The control plane admits the exact RU/entry/exit route before Android opens a TUN. */
+/** Enroll the device at the selected RU entry. The running tunnel selects the exit. */
 internal class RuWireGuardConnectionCoordinator(
     private val context: Context,
     private val repository: SettingsRepository,
     private val api: BackendApiClient,
-    private val physicalNetwork: Network,
+    private val sampler: ClientLatencySampler = ClientLatencySampler.startup(context),
+    private val challengeSigner: (String) -> String = DeviceIdentity::signChallenge,
+    private val random: () -> Double = { kotlin.random.Random.nextDouble() },
 ) {
-    suspend fun prepare(settings: StoredSettings): PreparedRuWireGuardConnection = withTimeoutOrNull(30_000L) {
+    suspend fun prepare(settings: StoredSettings, excludedPairs: Set<Pair<String, String>> = emptySet()): PreparedRuWireGuardConnection = withTimeoutOrNull(30_000L) {
         require(settings.advancedSettings.ruRelayEnabled) {
             "ru_wireguard_selection_invalid"
         }
-        val multiHop = settings.advancedSettings.multiHop
-        val hops = multiHop.explicitNodeIds()
-        val entryId = hops?.first
-        val exitId = hops?.second
         val token = settings.backendAccessToken?.takeIf(String::isNotBlank)
             ?: throw IllegalStateException("auth_required")
         val deviceKey = repository.ensureBackendDeviceKey(settings.backendDeviceKey)
@@ -86,118 +74,82 @@ internal class RuWireGuardConnectionCoordinator(
             check(saved) { "selection_changed" }
             registered.id
         }
-        val requestedExit = exitId ?: settings.userProfile.selectedNodeId.takeIf {
-            settings.userProfile.serverSelectionMode == ServerSelectionMode.SERVER && it.isNotBlank()
-        }
-        val firstCatalog = api.ruRelayCatalog(token, device, deviceKey, requestedExit, entryId)
-        val foreignNodes = firstCatalog.foreignNodes
-        val country = settings.userProfile.selectedCountryCode.uppercase()
-        if (entryId != null) check(foreignNodes.any { it.id == entryId }) {
-            "multihop_entry_unavailable"
-        }
-        val candidates = foreignNodes.asSequence().filter { candidate ->
-            if (multiHop.enabled) candidate.id == exitId
-            else (settings.userProfile.serverSelectionMode == ServerSelectionMode.AUTO || candidate.countryCode.uppercase() == country) &&
-                (settings.userProfile.selectedNodeId.isBlank() ||
-                    settings.userProfile.serverSelectionMode != ServerSelectionMode.SERVER ||
-                    candidate.id == settings.userProfile.selectedNodeId)
-        }
-            .sortedBy { it.id }
-            .toList()
-        var selectedExit: RuForeignNode? = null
-        var selectedCatalog: RuRelayCatalog? = null
-        for (candidate in candidates) {
-            val catalog = if (candidate.id == requestedExit) firstCatalog
-                else api.ruRelayCatalog(token, device, deviceKey, candidate.id, entryId)
-            val available = catalog.relays.any { relay -> relay.available }
-            if (available) {
-                selectedExit = candidate
-                selectedCatalog = catalog
-                break
-            }
-        }
-        val exit = selectedExit ?: throw IllegalStateException("ru_relay_pair_unavailable")
-        val catalog = checkNotNull(selectedCatalog)
         val pair = WireGuardKeyStore.android(context).getOrCreate()
-        var response: BackendRuWireGuardSession? = null
         try {
-            val (relayRttSamples, key) = coroutineScope {
-                val samples = async {
-                    measureRuRelayRtt(catalog) { relay ->
-                        runInterruptible(Dispatchers.IO) {
-                            DeviceLatency.measureTcpConnectMs(
-                                relay.probeHost!!, relay.probePort!!, timeoutMs = 1_800,
-                                onDiagnostic = {},
-                                socketFactory = { physicalNetwork.socketFactory.createSocket() },
-                            )
-                        }
+            val publicKey = pair.publicKeyBase64()
+            val userId = settings.userProfile.backendUserId
+            val cached = repository.readRuEntry(userId, device, publicKey)
+            val cachedCredential = cached?.let { RuWireGuardSessionJsonParser.parseEntryCredential(it) }
+                ?.takeIf { it.expiresAtEpochMillis > System.currentTimeMillis() }
+            val savedExits = cached?.getJSONArray("exits")?.let { array ->
+                (0 until array.length()).map { index ->
+                    val item = array.getJSONObject(index)
+                    RuForeignNode(item.getString("id"), item.getString("name"), item.getString("country_code"))
+                }
+            }.orEmpty()
+            // A lease is a credential, not a permanent AUTO choice. Refresh eligibility first.
+            val inventory = try { api.ruRelayCatalog(token, device, deviceKey) } catch (error: Exception) {
+                val transient = error is java.io.IOException || error is BackendException && error.statusCode in setOf(502, 503, 504)
+                val fallback = eligibleExits(settings, savedExits).filter { cachedCredential?.relayNodeId to it.id !in excludedPairs }
+                if (!transient || cachedCredential == null || fallback.isEmpty()) throw error
+                // Offline fallback is bounded by the existing credential's expiry and the gateway ACK.
+                val exit = EndpointRankingPolicy.rankNodes(fallback, { it.id }, { null }, { 1 }, { null }, random = random).first()
+                return@withTimeoutOrNull PreparedRuWireGuardConnection(cachedCredential, pair.privateKey, exit)
+            }
+            val eligible = eligibleExits(settings, inventory.foreignNodes)
+            val exitSamples = if (eligible.size > 1) sampler.measureNodes(eligible,
+                { it.id }, { it.probeHost }, { it.probePort }, { it.probeIp }) else emptyMap()
+            val exits = EndpointRankingPolicy.rankNodes(eligible, { it.id }, { exitSamples[it.id] },
+                { it.selectionWeight }, { it.metricsAt }, random = random)
+            var lastFailure: Exception = BackendException("ru_relay_pair_unavailable", 503)
+            var keyId: String? = null
+            for (exit in exits) {
+                val catalog = try { api.ruRelayCatalog(token, device, deviceKey, exit.id) } catch (error: BackendException) {
+                    when (error.statusCode) {
+                        404 -> inventory // Older entry-route servers expose only the global inventory.
+                        503 -> { lastFailure = error; continue }
+                        else -> throw error
                     }
                 }
-                val registered = DeviceIdentity.withChallengeTransaction {
-                    val keyProof = api.createDeviceChallenge(token, device)
-                    api.registerRuWireGuardKey(token, device, deviceKey, keyProof.nonce,
-                        DeviceIdentity.signChallenge(keyProof.nonce), pair.publicKeyBase64())
+                val eligibleRelays = catalog.relays.filter { it.available && it.pairReady && it.id to exit.id !in excludedPairs }
+                val relaySamples = if (eligibleRelays.size > 1) sampler.measureNodes(eligibleRelays,
+                    { it.id }, { it.probeHost }, { it.probePort }, { it.probeIp }) else emptyMap()
+                val relays = EndpointRankingPolicy.rankNodes(eligibleRelays, { it.id }, { relaySamples[it.id] },
+                    { it.selectionWeight }, { it.metricsAt }, random = random)
+                for (relay in relays) {
+                    try {
+                        val credential = if (cachedCredential?.relayNodeId == relay.id) cachedCredential else {
+                            if (keyId == null) keyId = api.registerRuWireGuardKey(token, device, deviceKey, publicKey).id
+                            DeviceIdentity.withChallengeTransaction {
+                                val proof = api.createDeviceChallenge(token, device)
+                                api.enrollRuEntry(token, device, deviceKey, proof.nonce, challengeSigner(proof.nonce), checkNotNull(keyId), relay.id)
+                            }
+                        }
+                        check(credential.expiresAtEpochMillis > System.currentTimeMillis()) { "ru_entry_expired" }
+                        repository.saveRuEntry(userId, device, publicKey, credential, inventory.foreignNodes)
+                        return@withTimeoutOrNull PreparedRuWireGuardConnection(credential, pair.privateKey, exit, enrolled = credential !== cachedCredential)
+                    } catch (error: BackendException) {
+                        if (error.statusCode != 503) throw error
+                        lastFailure = error
+                    }
                 }
-                samples.await() to registered
             }
-            val initialResponse = DeviceIdentity.withChallengeTransaction {
-                val sessionProof = api.createDeviceChallenge(token, device)
-                api.createRuWireGuardSession(token, RuWireGuardSessionRequest(
-                    deviceId = device,
-                    deviceKey = deviceKey,
-                    deviceNonce = sessionProof.nonce,
-                    deviceSignature = DeviceIdentity.signChallenge(sessionProof.nonce),
-                    requestId = UUID.randomUUID().toString(),
-                    publicKeyId = key.id,
-                    exitNodeId = exit.id,
-                    entryNodeId = entryId,
-                    routeVersion = catalog.routeVersion,
-                    relaySelection = RuRelaySelection.Auto,
-                    relayRttSamples = relayRttSamples,
-                ))
-            }
-            response = initialResponse
-            val initialIdentity = initialResponse.identity
-            repository.stageRuWireGuardRevoke(PendingRuWireGuardRevoke(
-                initialIdentity.sessionId, checkNotNull(initialIdentity.revokeToken), provisional = true,
-            ))
-            response = api.activateRuWireGuardSession(token, device, deviceKey, initialIdentity)
-            val ready = awaitRuWireGuardReady(checkNotNull(response),
-                poll = { api.pollRuWireGuardSession(token, device, deviceKey, initialIdentity) })
-            return@withTimeoutOrNull PreparedRuWireGuardConnection(ready, pair.privateKey, exit)
+            throw lastFailure
         } catch (error: Throwable) {
             pair.privateKey.fill(0)
-            response?.identity?.let { identity ->
-                identity.revokeToken?.let { revokeToken ->
-                    runCatching {
-                        repository.stageRuWireGuardRevoke(PendingRuWireGuardRevoke(identity.sessionId, revokeToken))
-                        PendingRuWireGuardRevokeWorker.enqueue(context)
-                    }
-                }
-            }
             throw error
         }
     } ?: throw IllegalStateException("ru_wireguard_session_timeout")
 
-}
+    private fun eligibleExits(settings: StoredSettings, exits: List<RuForeignNode>): List<RuForeignNode> = exits.filter { exit ->
+        val profile = settings.userProfile
+        when (profile.serverSelectionMode) {
+            ServerSelectionMode.AUTO -> true
+            ServerSelectionMode.COUNTRY -> exit.countryCode.equals(profile.selectedCountryCode, true)
+            ServerSelectionMode.SERVER -> exit.id == profile.selectedNodeId
+        }
+    }
 
-/** Fresh samples from real pair probes; absent targets leave weighted selection to the server. */
-internal suspend fun measureRuRelayRtt(
-    catalog: RuRelayCatalog,
-    probe: suspend (RuRelayCatalogEntry) -> Int?,
-): List<RuRelayRttSample> = coroutineScope {
-    val slots = Semaphore(6)
-    val targets = catalog.relays.filter { it.available && it.pairReady && it.probeHost != null && it.probePort != null }.take(32)
-    val samples = targets.map { relay ->
-            async {
-                withTimeoutOrNull(2_500L) {
-                    slots.withPermit {
-                        probe(relay)?.takeIf { it in 1..3000 }?.let { RuRelayRttSample(relay.id, it) }
-                    }
-                }
-            }
-        }.awaitAll().filterNotNull()
-    samples
 }
 
 internal suspend fun awaitRuWireGuardReady(

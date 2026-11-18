@@ -10,24 +10,38 @@ object EndpointRankingPolicy {
         nowMillis: Long = System.currentTimeMillis(),
         random: () -> Double = { kotlin.random.Random.nextDouble() },
     ): List<VpnServer> {
-        val remaining = servers.distinctBy { it.id }.filter { server ->
+        val eligible = servers.distinctBy { it.id }.filter { server ->
             server.isOnline && server.weight > 0 && when (profile.serverSelectionMode) {
                 ServerSelectionMode.AUTO -> true
                 ServerSelectionMode.COUNTRY -> server.countryCode.equals(profile.selectedCountryCode, true)
                 ServerSelectionMode.SERVER -> server.id == profile.selectedNodeId
             }
-        }.toMutableList()
+        }
+        return rankNodes(eligible, { it.id }, { it.latencyMs }, { it.weight }, { it.metricsAt }, nowMillis, random)
+    }
+
+    /** One selection policy for authorised physical nodes, regardless of the route using them. */
+    fun <T> rankNodes(
+        nodes: List<T>,
+        id: (T) -> String,
+        latencyMs: (T) -> Int?,
+        selectionWeight: (T) -> Int,
+        metricsAt: (T) -> String?,
+        nowMillis: Long = System.currentTimeMillis(),
+        random: () -> Double = { kotlin.random.Random.nextDouble() },
+    ): List<T> {
+        val remaining = nodes.distinctBy(id).filter { selectionWeight(it) > 0 }.toMutableList()
         return buildList {
             while (remaining.isNotEmpty()) {
-                val fastest = remaining.mapNotNull { it.latencyMs }.minOrNull()
+                val fastest = remaining.mapNotNull(latencyMs).minOrNull()
                 val pool = if (fastest == null) remaining.toList() else remaining.filter {
-                    it.latencyMs?.let { ping -> ping <= fastest + maxOf(20, fastest / 4) } == true
+                    latencyMs(it)?.let { ping -> ping <= fastest + maxOf(20, fastest / 4) } == true
                 }
                 val weights = pool.map { server ->
-                    val metricsTime = server.metricsAt?.let { runCatching { java.time.Instant.parse(it).toEpochMilli() }.getOrNull() }
+                    val metricsTime = metricsAt(server)?.let { runCatching { java.time.Instant.parse(it).toEpochMilli() }.getOrNull() }
                     // Unknown/stale telemetry is neutral, never an invented empty server.
                     if (metricsTime != null && nowMillis - metricsTime in 0..120_000L) {
-                        server.weight.toDouble().coerceAtLeast(1.0)
+                        selectionWeight(server).toDouble().coerceAtLeast(1.0)
                     } else 1.0
                 }
                 var ticket = random().coerceIn(0.0, 0.999999999) * weights.sum()

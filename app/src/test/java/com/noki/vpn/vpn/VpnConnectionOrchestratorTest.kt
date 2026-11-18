@@ -474,7 +474,7 @@ private class RecordingVpnCoreRuntime(
     override fun rebindNetwork(): Boolean = true
     override fun wake() = Unit
 
-    override fun start(config: String, tunFd: Int): Boolean {
+    override fun start(config: String, tunFd: Int, routingRules: AppVpnRoutingRules.Ready?): Boolean {
         events += "start_core"
         return true
     }
@@ -504,7 +504,7 @@ private class BlockingFirstCancellationVpnCoreRuntime(
 
     private val cancellationCalls = AtomicInteger(0)
 
-    override fun start(config: String, tunFd: Int): Boolean = true
+    override fun start(config: String, tunFd: Int, routingRules: AppVpnRoutingRules.Ready?): Boolean = true
 
     override fun stop() = Unit
 

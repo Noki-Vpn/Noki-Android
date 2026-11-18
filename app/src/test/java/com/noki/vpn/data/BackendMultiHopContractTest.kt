@@ -88,7 +88,7 @@ class BackendMultiHopContractTest {
         val settings = AdvancedSettings(multiHop = route.selection,
             alwaysOnDomains = listOf("domain:russian.example"),
             bypassDomains = listOf(DomainRulePolicy.RUSSIAN_RESOURCES_RULE))
-        val geosite = GeositeAssetTest.asset("CATEGORY-RU" to listOf(GeositeAssetTest.domain(2, "russian.example")))
+        val geosite = GeositeAssetTest.snapshot("CATEGORY-RU" to listOf(GeositeAssetTest.domain(2, "russian.example")))
         for (candidate in session.endpointCandidates) {
             val profile = EndpointSelector.profileFromCandidate(session, candidate)
             assertTrue(VpnProfileValidator.isUsable(profile, settings))
@@ -114,7 +114,10 @@ class BackendMultiHopContractTest {
                 assertEquals(candidate.path, outbound.getJSONObject("transport").getString("path"))
             }
             val rules = config.getJSONObject("route").getJSONArray("rules")
-            assertEquals("direct", rules.getJSONObject(4).getString("outbound"))
+            val russian = (0 until rules.length()).map(rules::getJSONObject).first {
+                it.optJSONArray("domain_suffix")?.optString(0) == "russian.example"
+            }
+            assertEquals("direct", russian.getString("outbound"))
             assertEquals("proxy", rules.getJSONObject(rules.length() - 1).getString("outbound"))
             assertEquals("proxy", config.getJSONObject("route").getString("final"))
             assertEquals("proxy", config.getJSONObject("dns").getJSONArray("servers").getJSONObject(0).getString("detour"))
@@ -163,7 +166,7 @@ class BackendMultiHopContractTest {
             assertFalse(request.has("route_mode"))
             assertEquals("auto", request.getString("profile_code"))
             val capabilities = request.getJSONArray("capabilities")
-            assertEquals(setOf("nokinv_v1", "nokinv_release_v1"),
+            assertEquals(setOf("nokinv_v1", "nokinv_release_v1", "entry_route_v1"),
                 (0 until capabilities.length()).map { capabilities.getString(it) }.toSet())
             assertEquals(2, request.getJSONObject("multihop").getInt("version"))
             assertEquals(selection.entry!!.nodeId, request.getJSONObject("multihop").getJSONObject("entry").getString("node_id"))

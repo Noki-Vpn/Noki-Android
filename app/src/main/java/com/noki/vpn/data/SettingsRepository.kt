@@ -130,6 +130,28 @@ class SettingsRepository(private val context: Context) : VpnSessionStore, Endpoi
         }
     }
 
+    fun nextEntryRouteGeneration(): Long = synchronized(RU_WIREGUARD_REVOKE_LOCK) {
+        val generation = maxOf(System.currentTimeMillis(), preferences.getLong("entry_route_generation", 0L) + 1L)
+        check(preferences.edit().putLong("entry_route_generation", generation).commit()) { "entry_route_generation_persist_failed" }
+        generation
+    }
+
+    internal fun readRuEntry(userId: String, deviceId: String, publicKey: String): JSONObject? {
+        val encrypted = preferences.getString("ru_entry_credential", null) ?: return null
+        return runCatching { JSONObject(checkNotNull(cipher.decrypt(encrypted))) }.getOrNull()?.takeIf {
+            it.optString("user_id") == userId && it.optString("device_id") == deviceId && it.optString("public_key") == publicKey
+        }
+    }
+
+    internal fun saveRuEntry(userId: String, deviceId: String, publicKey: String, credential: RuEntryCredential, exits: List<RuForeignNode>) {
+        val json = RuWireGuardSessionJsonParser.encodeEntryCredential(credential)
+            .put("user_id", userId).put("device_id", deviceId).put("public_key", publicKey)
+            .put("exits", JSONArray(exits.map { exit -> JSONObject().put("id", exit.id).put("name", exit.name).put("country_code", exit.countryCode) }))
+        check(preferences.edit().putString("ru_entry_credential", cipher.encrypt(json.toString())).commit()) {
+            "ru_entry_credential_persist_failed"
+        }
+    }
+
     fun loadPendingRuWireGuardRevokes(): List<PendingRuWireGuardRevoke> =
         synchronized(RU_WIREGUARD_REVOKE_LOCK) { loadPendingRuWireGuardRevokesLocked() }
 

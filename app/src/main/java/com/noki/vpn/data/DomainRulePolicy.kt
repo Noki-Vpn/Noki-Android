@@ -31,14 +31,15 @@ object DomainRulePolicy {
     }
 
     fun normalizeSettings(settings: AdvancedSettings): AdvancedSettings {
-        val always = normalizeList(settings.alwaysOnDomains)
+        val always = normalizeList(settings.alwaysOnDomains).filterNot { it == RUSSIAN_RESOURCES_RULE }
         val alwaysSet = always.toSet()
-        val bypass = normalizeList(settings.bypassDomains).filterNot(alwaysSet::contains)
+        val bypass = normalizeList(settings.bypassDomains).filterNot { it == RUSSIAN_RESOURCES_RULE || it in alwaysSet }
         return settings.copy(alwaysOnDomains = always, bypassDomains = bypass)
     }
 
     fun addAlways(settings: AdvancedSettings, rawValue: String): AdvancedSettings {
         val rule = normalize(rawValue) ?: return settings
+        if (rule == RUSSIAN_RESOURCES_RULE) return settings
         return normalizeSettings(
             settings.copy(
                 alwaysOnDomains = settings.alwaysOnDomains + rule,
@@ -49,6 +50,7 @@ object DomainRulePolicy {
 
     fun addBypass(settings: AdvancedSettings, rawValue: String): AdvancedSettings {
         val rule = normalize(rawValue) ?: return settings
+        if (rule == RUSSIAN_RESOURCES_RULE) return settings
         return normalizeSettings(
             settings.copy(
                 alwaysOnDomains = settings.alwaysOnDomains.filterNot { normalize(it) == rule },

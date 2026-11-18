@@ -50,13 +50,12 @@ import com.noki.vpn.data.MultiHopSettings
 import com.noki.vpn.data.ServerLocation
 import com.noki.vpn.data.VpnServer
 import com.noki.vpn.data.ServerSelectionMode
-import com.noki.vpn.data.usesRuForeignNodeCatalog
+
+internal fun multiHopUnavailableText(language: AppLanguage): String = tr(language,
+    "Выключите RU-реле, чтобы включить MultiHop.", "Turn off RU relay to enable MultiHop.")
 
 internal fun multiHopNodes(state: AppUiState, entryRole: Boolean): List<VpnServer> =
-    if (usesRuForeignNodeCatalog(state.advancedSettings.ruRelayEnabled, state.ruForeignNodes)) state.ruForeignNodes
-        .filter { it.countryCode.isNotBlank() && !it.countryCode.equals("RU", true) }
-        .map { VpnServer(it.id, it.name, it.countryCode, "", "", null, true, latencyMs = it.latencyMs) }
-    else state.locations.flatMap(ServerLocation::servers).filter {
+    state.locations.flatMap(ServerLocation::servers).filter {
         it.isOnline && if (entryRole) it.multiHopEntryAvailable else it.multiHopExitAvailable
     }
 
@@ -88,14 +87,18 @@ fun MultiHopScreen(
     showBackground: Boolean = true,
 ) {
     val language = state.personalizationSettings.language
-    var draft by remember { mutableStateOf(state.advancedSettings.multiHop) }
+    var draft by remember(state.advancedSettings.multiHop) { mutableStateOf(state.advancedSettings.multiHop) }
     var attemptedSave by remember { mutableStateOf(false) }
     var openedPicker by remember { mutableStateOf<String?>(null) }
-    LaunchedEffect(Unit) { if (state.isAuthenticated) viewModel.refreshServers() }
-    val entries = remember(state.locations, state.ruForeignNodes, state.advancedSettings.ruRelayEnabled) {
+    val available = !state.advancedSettings.ruRelayEnabled
+    LaunchedEffect(available, state.isAuthenticated) {
+        if (available && state.isAuthenticated) viewModel.refreshServers()
+        if (!available) openedPicker = null
+    }
+    val entries = remember(state.locations) {
         multiHopNodes(state, entryRole = true)
     }
-    val exits = remember(state.locations, state.ruForeignNodes, state.advancedSettings.ruRelayEnabled) {
+    val exits = remember(state.locations) {
         multiHopNodes(state, entryRole = false)
     }
     val error = multiHopSelectionError(draft, entries, exits)
@@ -116,6 +119,14 @@ fun MultiHopScreen(
             verticalArrangement = Arrangement.spacedBy(metrics.dp(18f)),
         ) {
             val contentModifier = Modifier.widthIn(max = metrics.dp(370f)).fillMaxWidth()
+            if (!available) {
+                AdvancedText(
+                    text = multiHopUnavailableText(language),
+                    fontSize = 16f, lineHeight = 20f, color = AdvancedTextSecondary,
+                    modifier = contentModifier,
+                )
+                return@Column
+            }
             AdvancedToggleCard(
                 enabled = draft.enabled,
                 title = tr(language, "Включить MultiHop", "Enable MultiHop"),
@@ -178,7 +189,7 @@ fun MultiHopScreen(
                 onClick = viewModel::goBack,
             )
         }
-        if (openedPicker != null) MultiHopServerDialog(
+        if (available && openedPicker != null) MultiHopServerDialog(
             title = if (openedPicker == "entry") tr(language, "Входной сервер", "Entry server") else tr(language, "Выходной сервер", "Exit server"),
             selection = if (openedPicker == "entry") draft.entry else draft.exit,
             nodes = if (openedPicker == "entry") entries else exits,

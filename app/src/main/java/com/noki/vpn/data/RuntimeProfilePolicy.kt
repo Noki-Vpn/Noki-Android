@@ -1,6 +1,23 @@
 package com.noki.vpn.data
 
 object RuntimeProfilePolicy {
+    fun normalizeRouteModes(settings: AdvancedSettings): AdvancedSettings =
+        if (settings.ruRelayEnabled && settings.multiHop.enabled) {
+            settings.copy(multiHop = settings.multiHop.copy(enabled = false), gamingModeEnabled = false)
+        } else settings
+
+    fun normalizeRouteSelection(settings: StoredSettings): StoredSettings {
+        val advanced = normalizeRouteModes(settings.advancedSettings)
+        if (advanced == settings.advancedSettings &&
+            (!advanced.ruRelayEnabled || settings.profile.multiHop == null)) return settings
+        return settings.copy(
+            advancedSettings = advanced,
+            profile = profileAfterServerSelection(settings.profile),
+            endpointOptions = emptyList(),
+            ruRelaySelectionRevision = settings.ruRelaySelectionRevision + 1L,
+        )
+    }
+
     fun normalizeAdvancedSettings(settings: AdvancedSettings, profile: UserProfile): AdvancedSettings {
         return settings.copy(
             endpointSelectionMode = if (settings.protocol != VpnProtocol.AUTO) EndpointSelectionMode.MANUAL
@@ -13,11 +30,12 @@ object RuntimeProfilePolicy {
     fun profileAfterServerSelection(profile: VlessProfile): VlessProfile = profile.withoutRuntimeCredentials()
 
     fun normalize(settings: StoredSettings): StoredSettings {
-        if (settings.advancedSettings.ruRelayEnabled) return settings
-        return settings.copy(
+        val selected = normalizeRouteSelection(settings)
+        if (selected.advancedSettings.ruRelayEnabled) return selected
+        return selected.copy(
             profile = profileAfterProtocolChange(
-                profile = settings.profile,
-                protocol = settings.advancedSettings.effectiveProtocol,
+                profile = selected.profile,
+                protocol = selected.advancedSettings.effectiveProtocol,
             ),
         )
     }
@@ -80,7 +98,11 @@ object RuntimeProfilePolicy {
     }
 
     fun isCachedProfileUsable(settings: StoredSettings): Boolean {
-        if (settings.advancedSettings.multiHop.enabled || settings.advancedSettings.ruRelayEnabled) return false
+        if (settings.advancedSettings.ruRelayEnabled) return false
+        if (settings.advancedSettings.multiHop.enabled && !settings.profile.entryRoute) return false
+        if (settings.profile.entryRoute &&
+            (!settings.isAuthenticated || settings.userProfile.backendUserId.isBlank() || settings.backendDeviceId.isBlank() ||
+                (settings.profile.entryRouteExpiresAt ?: 0L) <= System.currentTimeMillis())) return false
         val endpointCode = settings.profile.endpointCode.trim()
         if (endpointCode.isBlank()) return false
         if (settings.endpointOptions.none { it.code == endpointCode }) return false
@@ -102,6 +124,8 @@ object RuntimeProfilePolicy {
             shortId = "",
             flow = "",
             multiHop = null,
+            entryRoute = false,
+            entryRouteExpiresAt = null,
         )
     }
 }

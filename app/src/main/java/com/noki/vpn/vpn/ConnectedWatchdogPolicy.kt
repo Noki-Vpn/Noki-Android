@@ -30,6 +30,7 @@ object ConnectedWatchdogPolicy {
     ): Boolean = captured == current
 
     const val CHECK_INTERVAL_MS = 60_000L
+    const val WAKE_FAILURE_RETRY_MS = 2_000L
     const val PROBE_AFTER_IDLE_MS = 120_000L
     const val RECOVERY_WINDOW_MS = 10 * 60_000L
     const val MAX_RECOVERIES_IN_WINDOW = 3

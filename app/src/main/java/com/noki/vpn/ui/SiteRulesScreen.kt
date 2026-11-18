@@ -73,6 +73,9 @@ internal fun siteRuleValidationError(
     }
     val normalized = DomainRulePolicy.normalize(value)
         ?: return tr(language, "Введите корректный домен", "Enter a valid domain")
+    if (normalized == DomainRulePolicy.RUSSIAN_RESOURCES_RULE) {
+        return tr(language, "Российские ресурсы всегда идут напрямую", "Russian resources always go directly")
+    }
     val editingNormalized = editingDomain?.let(DomainRulePolicy::normalize)
     val duplicate = normalized != editingNormalized &&
         domains.any { DomainRulePolicy.normalize(it) == normalized }
@@ -234,20 +237,13 @@ fun SiteRulesScreen(
                                     language = language,
                                     backdrop = sharedBackdrop,
                                     liveGlassEnabled = liveGlassEnabled,
-                                    russianResourcesEnabled = DomainRulePolicy.RUSSIAN_RESOURCES_RULE in domains,
                                     onEdit = {},
-                                    onDelete = {
-                                        if (DomainRulePolicy.RUSSIAN_RESOURCES_RULE in domains) {
-                                            viewModel.removeBypassDomain(DomainRulePolicy.RUSSIAN_RESOURCES_RULE)
-                                        } else {
-                                            viewModel.addBypassDomain(DomainRulePolicy.RUSSIAN_RESOURCES_RULE)
-                                        }
-                                    },
+                                    onDelete = {},
                                 )
                             }
                         }
                         items(
-                            items = domains.filterNot { mode == SiteRulesMode.BYPASS && it == DomainRulePolicy.RUSSIAN_RESOURCES_RULE },
+                            items = domains.filterNot { it == DomainRulePolicy.RUSSIAN_RESOURCES_RULE },
                             key = { it },
                             contentType = { "site-rule-row" },
                         ) { domain ->
@@ -382,7 +378,6 @@ private fun SiteRuleRow(
     language: AppLanguage,
     backdrop: PrismalGlassLayer?,
     liveGlassEnabled: Boolean,
-    russianResourcesEnabled: Boolean = false,
     onEdit: () -> Unit,
     onDelete: () -> Unit,
 ) {
@@ -412,21 +407,27 @@ private fun SiteRuleRow(
                 modifier = Modifier.weight(1f).padding(end = metrics.dp(8f)),
             )
             Row(horizontalArrangement = Arrangement.spacedBy(metrics.dp(7f))) {
-                if (!russianResources) SiteRulesButton(
-                    text = tr(language, "Изм.", "Edit"),
-                    modifier = Modifier.width(metrics.dp(46f)).height(metrics.dp(40f)),
-                    onClick = onEdit,
-                )
-                SiteRulesButton(
-                    text = if (russianResources) (if (russianResourcesEnabled) "on" else "off")
-                        else tr(language, "Удалить", "Delete"),
-                    danger = !russianResources || !russianResourcesEnabled,
-                    active = russianResources && russianResourcesEnabled,
-                    modifier = Modifier
-                        .width(metrics.dp(if (russianResources) 54f else 65f))
-                        .height(metrics.dp(40f)),
-                    onClick = onDelete,
-                )
+                if (russianResources) {
+                    SiteRulesText(
+                        text = tr(language, "Всегда напрямую", "Always direct"),
+                        fontSize = 13f,
+                        lineHeight = 16f,
+                        color = SiteRulesTextPrimary,
+                        modifier = Modifier,
+                    )
+                } else {
+                    SiteRulesButton(
+                        text = tr(language, "Изм.", "Edit"),
+                        modifier = Modifier.width(metrics.dp(46f)).height(metrics.dp(40f)),
+                        onClick = onEdit,
+                    )
+                    SiteRulesButton(
+                        text = tr(language, "Удалить", "Delete"),
+                        danger = true,
+                        modifier = Modifier.width(metrics.dp(65f)).height(metrics.dp(40f)),
+                        onClick = onDelete,
+                    )
+                }
             }
         }
     }

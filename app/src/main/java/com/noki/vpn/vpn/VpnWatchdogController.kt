@@ -34,6 +34,7 @@ internal class VpnWatchdogController(
     private var activeOwner: ConnectedWatchdogPolicy.Owner? = null
     private var settings: StoredSettings? = null
     private var activeProbe: CancelableTask? = null
+    private var wakeProbeOwner: ConnectedWatchdogPolicy.Owner? = null
     private var failureCount = 0
     private var lastHealthyMillis: Long? = null
     private var lastVpnEvidenceMillis: Long? = null
@@ -58,13 +59,15 @@ internal class VpnWatchdogController(
         val current = activeOwner
         if (owner != null && current != owner) return
         scheduler.cancel(scheduleOwner)
-        activeProbe?.cancel()
+        val probe = activeProbe
         activeProbe = null
+        wakeProbeOwner = null
         activeOwner = null
         settings = null
         failureCount = 0
         lastHealthyMillis = null
         lastVpnEvidenceMillis = null
+        probe?.cancel()
     }
 
     @Synchronized
@@ -75,17 +78,35 @@ internal class VpnWatchdogController(
     }
 
     @Synchronized
-    fun resetNetworkEvidence(preserveHealthyEvidence: Boolean = false) {
-        activeProbe?.cancel()
+    fun onWake() {
+        val owner = activeOwner ?: return
+        val snapshot = settings ?: return
+        val probe = activeProbe
+        val updated = owner.copy(networkRevision = owner.networkRevision + 1)
+        activeOwner = updated
         activeProbe = null
+        wakeProbeOwner = null
+        probe?.cancel()
+        scheduler.cancel(scheduleOwner)
+        scheduleNext(updated)
+        launchOwnedProbe(updated, snapshot, fromWake = true)
+    }
+
+    @Synchronized
+    fun resetNetworkEvidence(preserveHealthyEvidence: Boolean = false) {
+        val probe = activeProbe
+        activeProbe = null
+        wakeProbeOwner = null
+        val owner = activeOwner
+        val updated = owner?.copy(networkRevision = owner.networkRevision + 1)
+        activeOwner = updated
+        probe?.cancel()
         failureCount = 0
         if (!preserveHealthyEvidence) {
             lastHealthyMillis = null
             lastVpnEvidenceMillis = null
         }
-        val owner = activeOwner ?: return
-        val updated = owner.copy(networkRevision = owner.networkRevision + 1)
-        activeOwner = updated
+        if (updated == null) return
         scheduler.cancel(scheduleOwner)
         scheduleNext(updated)
     }
@@ -98,19 +119,20 @@ internal class VpnWatchdogController(
         if (activeOwner != owner || activeProbe == null) {
             return WatchdogProbeOutcome.Ignored
         }
+        val fromWake = wakeProbeOwner == owner
         activeProbe = null
+        wakeProbeOwner = null
         val healthy = VpnReadinessPolicy.accept(latencyMs)
         if (healthy) {
             failureCount = 0
             recordEvidence(WatchdogEvidence.VPN_PROBE)
             return WatchdogProbeOutcome.Healthy
         }
-        if (!ConnectedWatchdogPolicy.automaticRecoveryAllowed(checkNotNull(settings).userProfile.serverSelectionMode))
-            return WatchdogProbeOutcome.Unhealthy(WatchdogAction.None)
         return when (ConnectedWatchdogPolicy.probeDecision(false, failureCount)) {
             ConnectedWatchdogPolicy.ProbeDecision.Healthy -> error("Failed probe cannot be healthy")
             ConnectedWatchdogPolicy.ProbeDecision.Retry -> {
                 failureCount += 1
+                if (fromWake) scheduleNext(owner, ConnectedWatchdogPolicy.WAKE_FAILURE_RETRY_MS, forceProbe = true)
                 WatchdogProbeOutcome.Unhealthy(WatchdogAction.None)
             }
             ConnectedWatchdogPolicy.ProbeDecision.Recover -> {
@@ -170,18 +192,23 @@ internal class VpnWatchdogController(
         return ConnectedWatchdogPolicy.lockdownRetryDelayMillis(recoveryTimes, nowMillis())
     }
 
-    private fun scheduleNext(owner: ConnectedWatchdogPolicy.Owner) {
-        scheduler.schedule(scheduleOwner, ConnectedWatchdogPolicy.CHECK_INTERVAL_MS) {
+    private fun scheduleNext(
+        owner: ConnectedWatchdogPolicy.Owner,
+        delayMillis: Long = ConnectedWatchdogPolicy.CHECK_INTERVAL_MS,
+        forceProbe: Boolean = false,
+    ) {
+        scheduler.schedule(scheduleOwner, delayMillis) {
             synchronized(this) {
                 if (activeOwner != owner) return@schedule
                 val snapshot = settings ?: return@schedule
+                // Arm ordinary cadence first: synchronous completion may replace it with confirmation.
+                scheduleNext(owner)
                 val lastHealthy = lastHealthyMillis
-                if (lastHealthy == null ||
+                if (forceProbe || lastHealthy == null ||
                     nowMillis() - lastHealthy >= ConnectedWatchdogPolicy.PROBE_AFTER_IDLE_MS
                 ) {
                     launchOwnedProbe(owner, snapshot)
                 }
-                if (activeOwner == owner) scheduleNext(owner)
             }
         }
     }
@@ -189,11 +216,16 @@ internal class VpnWatchdogController(
     private fun launchOwnedProbe(
         owner: ConnectedWatchdogPolicy.Owner,
         settings: StoredSettings,
+        fromWake: Boolean = false,
     ) {
         if (activeProbe != null || activeOwner != owner) return
         val launching = CancelableTask {}
         activeProbe = launching
+        wakeProbeOwner = owner.takeIf { fromWake }
         val launched = launchProbe(owner, settings)
-        if (activeProbe === launching) activeProbe = launched
+        if (activeProbe === launching) {
+            activeProbe = launched
+            if (launched == null) wakeProbeOwner = null
+        }
     }
 }

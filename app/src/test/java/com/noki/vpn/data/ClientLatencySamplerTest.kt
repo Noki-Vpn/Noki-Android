@@ -15,6 +15,28 @@ import java.util.concurrent.atomic.AtomicInteger
 import kotlin.system.measureTimeMillis
 
 class ClientLatencySamplerTest {
+    @org.junit.Test fun icmpSelectionBindsTheRealPhysicalInterfaceAndRequiresAnAnswer() {
+        val commands = mutableListOf<List<String>>()
+        val measured = DeviceLatency.measureIcmpOnInterface("203.0.113.7", "wlan0") { args, _ ->
+            commands += args
+            if (args.containsAll(listOf("-I", "wlan0", "203.0.113.7")))
+                "rtt min/avg/max/mdev = 21.0/23.5/26.0/1.0 ms" else null
+        }
+        org.junit.Assert.assertEquals(24, measured)
+        org.junit.Assert.assertEquals(listOf("/system/bin/ping", "-I", "wlan0", "-c", "1", "-W", "1", "203.0.113.7"), commands.single())
+        org.junit.Assert.assertNull(DeviceLatency.measureIcmpOnInterface("203.0.113.7", "rmnet_data0") { args, _ ->
+            org.junit.Assert.assertEquals("rmnet_data0", args[2]); null
+        })
+        org.junit.Assert.assertNull(DeviceLatency.measureIcmpOnInterface("host.example", "wlan0") { _, _ -> error("DNS is not a physical ICMP target") })
+    }
+    @Test fun unknownListenerNeverInventsHttpsPortForSelectionOrPresentation() = runBlocking {
+        val calls = AtomicInteger()
+        val sampler = ClientLatencySampler(tcpConnect = { _, _, _ -> calls.incrementAndGet(); 12 },
+            icmpPing = { _, _, _ -> error("No authorised ICMP target") })
+        assertEquals(emptyMap<String, Int>(), sampler.measure(listOf(location().copy(servers = emptyList()))))
+        assertEquals(0, calls.get())
+    }
+
     @Test
     fun numericAddressBypassesEvenAnExhaustedDnsQueue() {
         val started = CountDownLatch(DeviceLatency.MAX_CONCURRENT_DNS_LOOKUPS)
@@ -317,5 +339,6 @@ class ClientLatencySamplerTest {
         city = "Warsaw",
         host = "pl-$index.example",
         isOnline = true,
+        servers = listOf(VpnServer("node-$index", "Node", "PL", "pl-$index", "pl-$index.example", 443, true)),
     )
 }

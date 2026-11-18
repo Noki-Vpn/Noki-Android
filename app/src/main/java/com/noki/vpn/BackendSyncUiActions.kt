@@ -3,7 +3,6 @@ package com.noki.vpn
 import android.os.SystemClock
 import com.noki.vpn.data.AuthRefreshRejectedException
 import com.noki.vpn.data.ServerLocation
-import com.noki.vpn.data.MultiHopSettings
 import com.noki.vpn.data.RuForeignNode
 import com.noki.vpn.data.VpnConnectionState
 import com.noki.vpn.data.clientLatencyTargetKey
@@ -288,13 +287,10 @@ internal fun AppUiRuntime.applyBackendSyncMetadata(result: BackendSyncResult) {
 internal fun clientLatencyRequestTarget(
     locations: List<ServerLocation>,
     ruRelayEnabled: Boolean = false,
-    multiHop: MultiHopSettings = MultiHopSettings(),
     foreignNodes: List<RuForeignNode> = emptyList(),
 ): List<String> {
     if (ruRelayEnabled) {
-        val hops = runCatching { multiHop.explicitNodeIds() }.getOrElse { return emptyList() }
-        return foreignNodes.filter { hops == null || it.id == hops.second }
-            .map { "ru:1:${hops?.first ?: "null"}:${it.id}" }.distinct().sorted()
+        return foreignNodes.map { "ru:1:${it.id}" }.distinct().sorted()
     }
     return locations
         .asSequence()
@@ -319,9 +315,8 @@ internal fun AppUiRuntime.refreshClientLatenciesAsync(
     val attempt = authSessionCoordinator.attempt() ?: return
     val networkSignature = clientLatencySampler.networkSignature()
     val ruRelayEnabled = uiState.advancedSettings.ruRelayEnabled
-    val multiHop = uiState.advancedSettings.multiHop
     val foreignNodes = uiState.ruForeignNodes
-    val target = clientLatencyRequestTarget(locations, ruRelayEnabled, multiHop, foreignNodes)
+    val target = clientLatencyRequestTarget(locations, ruRelayEnabled, foreignNodes)
     if (target.isEmpty()) return
     val activeJob = clientLatencyRefreshJob
     if (activeJob != null) {
@@ -339,14 +334,14 @@ internal fun AppUiRuntime.refreshClientLatenciesAsync(
         val ownerJob = currentCoroutineContext()[Job]
             ?: error("Client latency coroutine has no Job")
         try {
-            val measured = measureClientLatencies(locations, ruRelayEnabled, multiHop, foreignNodes)
+            val measured = measureClientLatencies(locations, ruRelayEnabled, foreignNodes)
             if (
                 clientLatencySampler.networkSignature() != networkSignature ||
                 clientLatencyRefreshJob !== ownerJob ||
                 !ownerJob.isActive ||
                 !authSessionCoordinator.isCurrent(attempt) ||
                 clientLatencyRequestTarget(uiState.locations, uiState.advancedSettings.ruRelayEnabled,
-                    uiState.advancedSettings.multiHop, uiState.ruForeignNodes) != target
+                    uiState.ruForeignNodes) != target
             ) {
                 return@launch
             }
@@ -401,11 +396,9 @@ internal fun AppUiRuntime.hasMissingClientLatency(locations: List<ServerLocation
 internal suspend fun AppUiRuntime.measureClientLatencies(
     locations: List<ServerLocation>,
     ruRelayEnabled: Boolean = uiState.advancedSettings.ruRelayEnabled,
-    multiHop: MultiHopSettings = uiState.advancedSettings.multiHop,
     foreignNodes: List<RuForeignNode> = uiState.ruForeignNodes,
 ): Map<String, Int> {
     if (!ruRelayEnabled) return clientLatencySampler.measure(locations)
-    val hops = runCatching { multiHop.explicitNodeIds() }.getOrElse { return emptyMap() }
     val attempt = authSessionCoordinator.attempt() ?: return emptyMap()
     val network = com.noki.vpn.vpn.AndroidUnderlyingNetworkSource(application)
         .currentSnapshot()?.network ?: return emptyMap()
@@ -414,15 +407,14 @@ internal suspend fun AppUiRuntime.measureClientLatencies(
     val deviceKey = backendDeviceKey
     val targets = coroutineScope {
         val slots = Semaphore(4)
-        foreignNodes.filter { hops == null || it.id == hops.second }
-            .distinctBy { it.id }.map { server ->
+        foreignNodes.distinctBy { it.id }.map { server ->
                 async {
                     val key = clientLatencyTargetKey(server)
                     val relays = withTimeoutOrNull(8_000L) {
                         slots.withPermit {
                             try {
                                 authSessionCoordinator.run(attempt) { token ->
-                                    probeApi.ruRelayCatalog(token, deviceId, deviceKey, server.id, hops?.first, routeVersion = 1)
+                                    probeApi.ruRelayCatalog(token, deviceId, deviceKey, server.id, routeVersion = 1)
                                 }.relays
                             } catch (cancelled: CancellationException) {
                                 throw cancelled

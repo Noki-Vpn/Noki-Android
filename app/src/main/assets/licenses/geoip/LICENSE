@@ -1,0 +1,11 @@
+V2Fly GeoIP
+https://github.com/v2fly/geoip/releases/tag/202611080027
+
+The bundled GeoIP data extracts the RU category from the upstream geoip.dat.
+V2Fly distributes GeoIP under Creative Commons Attribution-ShareAlike 4.0:
+https://creativecommons.org/licenses/by-sa/4.0/
+
+IP address data by DB-IP:
+https://db-ip.com/
+Creative Commons Attribution 4.0:
+https://creativecommons.org/licenses/by/4.0/

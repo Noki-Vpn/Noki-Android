@@ -2,10 +2,6 @@ package com.noki.vpn.data
 
 import org.json.JSONObject
 import kotlinx.coroutines.runBlocking
-import kotlinx.coroutines.awaitCancellation
-import kotlinx.coroutines.withTimeout
-import kotlinx.coroutines.withTimeoutOrNull
-import com.noki.vpn.vpn.measureRuRelayRtt
 import okhttp3.OkHttpClient
 import okhttp3.Protocol
 import okhttp3.Response
@@ -16,22 +12,41 @@ import org.junit.Assert.assertThrows
 import org.junit.Test
 
 class RuRelayCatalogTest {
+    @Test fun selectionUsesOnlyDynamicWeightsAndNeverInventsTcpOnWireGuardNodes() {
+        val json = JSONObject("""{"route_version":1,"entry_node_id":null,"exit_node_id":null,
+            "relays":[{"id":"22222222-2222-4222-8222-222222222222","name":"RU","country_code":"RU",
+                "available":true,"pair_ready":true,"weight":999,"selection_weight":4,
+                "metrics_at":"2026-11-18T00:00:00Z","probe_ip":"203.0.113.4","probe_host":null,"probe_port":null}],
+            "foreign_nodes":[{"id":"11111111-1111-4111-8111-111111111111","name":"NL","country_code":"NL","weight":999}]}""")
+        val catalog = RuRelayCatalogJsonParser.parse(json, null)
+        assertEquals(4, catalog.relays.single().selectionWeight)
+        assertEquals("203.0.113.4", catalog.relays.single().probeIp)
+        assertEquals(null, catalog.relays.single().probePort)
+        assertEquals(1, catalog.foreignNodes.single().selectionWeight)
+        json.getJSONArray("relays").getJSONObject(0).remove("selection_weight")
+        assertEquals(1, RuRelayCatalogJsonParser.parse(json, null).relays.single().selectionWeight)
+    }
     private val exitId = "11111111-1111-4111-8111-111111111111"
     private val readyId = "22222222-2222-4222-8222-222222222222"
     private val offlineId = "33333333-3333-4333-8333-333333333333"
 
     @Test
-    fun discoversRealForeignParticipantsWithoutTransportEndpoints() = runBlocking {
+    fun discoversEntryRelaysAndRealForeignParticipantsWithoutSelectedExit() = runBlocking {
         var observed: okhttp3.Request? = null
         val client = OkHttpClient.Builder().addInterceptor { chain ->
             observed = chain.request()
             Response.Builder().request(chain.request()).protocol(Protocol.HTTP_1_1).code(200).message("OK")
-                .body("""{"route_version":1,"entry_node_id":null,"exit_node_id":null,"relays":[],
+                .body("""{"route_version":1,"entry_node_id":null,"exit_node_id":null,"relays":[
+                    {"id":"$readyId","name":"Moscow","country_code":"RU","available":true,"pair_ready":true},
+                    {"id":"$offlineId","name":"Kazan","country_code":"RU","available":false,"pair_ready":false,"unavailable_reason":"entry_unready"}],
                     "foreign_nodes":[{"id":"$exitId","name":"NL overlay","country_code":"NL"}]}"""
                     .toResponseBody("application/json".toMediaType())).build()
         }.build()
         val result = BackendApiClient(client, "https://api.example").ruRelayCatalog("access", readyId, "proof")
         assertEquals(listOf(RuForeignNode(exitId, "NL overlay", "NL")), result.foreignNodes)
+        assertEquals(listOf(readyId, offlineId), result.relays.map { it.id })
+        assertEquals(listOf(true, false), result.relays.map { it.available && it.pairReady })
+        assertEquals("entry_unready", result.relays[1].unavailableReason)
         assertEquals(null, observed!!.url.queryParameter("exit_node_id"))
         assertEquals(readyId, observed!!.header("X-Device-Id"))
         assertEquals("proof", observed!!.header("X-Device-Key"))
@@ -55,72 +70,18 @@ class RuRelayCatalogTest {
     }
 
     @Test
-    fun absentOrUnreachableTcpTargetsPermitWeightedAdmission() = runBlocking {
-        val noTargets = RuRelayCatalog(exitId, listOf(RuRelayCatalogEntry(readyId, "RU", "RU", true, null)))
-        assertEquals(emptyList<RuRelayRttSample>(), measureRuRelayRtt(noTargets) { error("no target must be dialed") })
-        val target = noTargets.copy(relays = listOf(noTargets.relays.single().copy(probeHost = "8.8.8.8", probePort = 20000, pairReady = true)))
-        assertEquals(emptyList<RuRelayRttSample>(), measureRuRelayRtt(target) { null })
-    }
-
-    @Test
-    fun freshConnectSamplesOnlyReachablePairTcpProbes() = runBlocking {
-        val ru3Id = "55555555-5555-4555-8555-555555555555"
-        val noProbeId = "44444444-4444-4444-8444-444444444444"
-        val catalog = RuRelayCatalog(exitId, listOf(
-            RuRelayCatalogEntry(readyId, "RU2", "RU", true, null, "192.0.2.2", 20045, pairReady = true),
-            RuRelayCatalogEntry(ru3Id, "RU3", "RU", true, null, "192.0.2.3", 20050, pairReady = true),
-            RuRelayCatalogEntry(offlineId, "RU4", "RU", false, "offline", "192.0.2.4", 20055),
-            RuRelayCatalogEntry(noProbeId, "RU5", "RU", true, null, "192.0.2.5"),
-        ))
-        val first = measureRuRelayRtt(catalog) { relay ->
-            if (relay.id == readyId) null else 42
-        }
-        assertEquals(listOf(RuRelayRttSample(ru3Id, 42)), first)
-        val second = measureRuRelayRtt(catalog) { relay ->
-            if (relay.id == ru3Id) null else 28
-        }
-        assertEquals(listOf(RuRelayRttSample(readyId, 28)), second)
-    }
-
-    @Test
-    fun queuedStalledRelayProbesShareOneDeadlineAndKeepReadySamples() = runBlocking {
-        val catalog = RuRelayCatalog(exitId, (1..32).map { index ->
-            RuRelayCatalogEntry("relay-$index", "RU$index", "RU", true, null,
-                "192.0.2.$index", 20000 + index, pairReady = true)
-        })
-        var active = 0
-        var maximumActive = 0
-        val samples = withTimeout(4_000L) {
-            measureRuRelayRtt(catalog) { relay ->
-                active++
-                maximumActive = maxOf(maximumActive, active)
-                try {
-                    if (relay.id == "relay-1") 42 else awaitCancellation()
-                } finally {
-                    active--
-                }
-            }
-        }
-        assertEquals(listOf(RuRelayRttSample("relay-1", 42)), samples)
-        assertEquals(6, maximumActive)
-        assertEquals(0, active)
-    }
-
-    @Test
-    fun callerCancellationStopsActiveAndQueuedRelayProbes() = runBlocking {
-        val catalog = RuRelayCatalog(exitId, (1..32).map { index ->
-            RuRelayCatalogEntry("relay-$index", "RU$index", "RU", true, null,
-                "192.0.2.$index", 20000 + index, pairReady = true)
-        })
-        var active = 0
-        val samples = withTimeoutOrNull(50L) {
-            measureRuRelayRtt(catalog) {
-                active++
-                try { awaitCancellation() } finally { active-- }
-            }
-        }
-        assertEquals(null, samples)
-        assertEquals(0, active)
+    fun routeDiscoveryUsesTheCommonSamplerWithoutInventedPortsOrAnswers() = runBlocking {
+        val targets = listOf(
+            RuRelayCatalogEntry(readyId, "Ready", "RU", true, null, "192.0.2.2", 25001, pairReady = true),
+            RuRelayCatalogEntry(offlineId, "Unknown", "RU", true, null, pairReady = true),
+        )
+        val sampler = ClientLatencySampler(tcpConnect = { host, port, _ ->
+            assertEquals("192.0.2.2", host); assertEquals(25001, port); 28
+        }, icmpPing = { _, _, _ -> error("No unbound fallback") }, tcpAttempts = 1)
+        assertEquals(mapOf(readyId to 28), sampler.measureNodes(targets,
+            { it.id }, { it.probeHost }, { it.probePort }, { it.probeIp }))
+        assertEquals(emptyMap<String, Int>(), ClientLatencySampler(tcpConnect = { _, _, _ -> null })
+            .measureNodes(targets, { it.id }, { it.probeHost }, { it.probePort }, { it.probeIp }))
     }
 
     @Test

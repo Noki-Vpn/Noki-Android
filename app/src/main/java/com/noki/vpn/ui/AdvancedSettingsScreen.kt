@@ -36,6 +36,7 @@ import com.styropyr0.prismal.sources.prismalGlassLayer
 import com.noki.vpn.AppUiState
 import com.noki.vpn.MainViewModel
 import com.noki.vpn.manualEndpointOptionsForCurrentCountry
+import com.noki.vpn.data.DomainRulePolicy
 import com.noki.vpn.data.EndpointSelectionMode
 import kotlinx.coroutines.delay
 
@@ -75,8 +76,8 @@ fun AdvancedSettingsScreen(
             val context = LocalContext.current
             val language = state.personalizationSettings.language
             val autoEndpointSelection = state.advancedSettings.endpointSelectionMode == EndpointSelectionMode.AUTO
-            val alwaysOnCount = state.advancedSettings.alwaysOnDomains.size
-            val bypassCount = state.advancedSettings.bypassDomains.size
+            val alwaysOnCount = state.advancedSettings.alwaysOnDomains.count { it != DomainRulePolicy.RUSSIAN_RESOURCES_RULE }
+            val bypassCount = state.advancedSettings.bypassDomains.count { it != DomainRulePolicy.RUSSIAN_RESOURCES_RULE }
             var showProtocolSheet by rememberSaveable { mutableStateOf(false) }
             var showProtocolNotice by rememberSaveable { mutableStateOf(false) }
             LaunchedEffect(state.advancedSettings.ruRelayEnabled, state.advancedSettings.gamingModeEnabled) {
@@ -296,20 +297,19 @@ fun AdvancedSettingsScreen(
                     liveGlassEnabled = liveGlassEnabled,
                     modifier = Modifier.widthIn(max = metrics.dp(370f)).fillMaxWidth()
                         .height(metrics.dp(NokiUiKitPolicy.advancedProtocolToggleCardHeightDp))
-                        .clickable(onClick = onMultiHopClicked),
+                        .clickable(enabled = !state.advancedSettings.ruRelayEnabled, onClick = onMultiHopClicked),
                 ) {
                     AdvancedText(
                         text = "MultiHop",
                         fontSize = 16f,
                         lineHeight = 20f,
-                        color = AdvancedTextPrimary,
+                        color = if (state.advancedSettings.ruRelayEnabled) AdvancedTextSecondary else AdvancedTextPrimary,
                         modifier = Modifier.fillMaxWidth().padding(horizontal = metrics.dp(20f)),
                     )
                 }
-                if (state.advancedSettings.multiHop.enabled) {
+                if (state.advancedSettings.ruRelayEnabled || state.advancedSettings.multiHop.enabled) {
                     AdvancedText(
-                        text = if (state.advancedSettings.ruRelayEnabled) tr(language,
-                            "MultiHop работает через RU-реле.", "MultiHop uses RU relay.") else tr(language,
+                        text = if (state.advancedSettings.ruRelayEnabled) multiHopUnavailableText(language) else tr(language,
                             "MultiHop работает через выбранный вход и выход.",
                             "MultiHop uses the selected entry and exit."),
                         fontSize = 12f, lineHeight = 16f, color = AdvancedTextSecondary,

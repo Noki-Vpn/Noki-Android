@@ -13,21 +13,31 @@ import androidx.work.WorkerParameters
 import com.noki.vpn.data.BackendApiClient
 import com.noki.vpn.data.DomainRulePolicy
 import kotlinx.coroutines.CancellationException
+import java.io.ByteArrayInputStream
+import java.io.ByteArrayOutputStream
 import java.io.File
+import java.io.InputStream
+import java.net.Inet6Address
+import java.net.InetAddress
 import java.nio.ByteBuffer
 import java.nio.charset.CodingErrorAction
 import java.nio.charset.StandardCharsets
 import java.security.MessageDigest
 import java.util.Locale
 import java.util.concurrent.TimeUnit
+import java.util.zip.ZipInputStream
 import org.json.JSONArray
 import org.json.JSONObject
 
-/** The verified protobuf asset remains valid across network failures and app upgrades. */
+/** Installs the verified geosite and GeoIP release as one atomic snapshot. */
 internal object GeositeAsset {
-    private const val NAME = "geosite.dat"
-    const val MAX_BYTES = 32 * 1024 * 1024
+    private const val NAME = "geodata.zip"
+    private const val MAX_BYTES = 32 * 1024 * 1024
+    private const val MAX_MANIFEST_BYTES = 4 * 1024
+    private val mandatorySuffixes = setOf("ru", "su", "xn--p1ai")
     private var validatedDigest: String? = null
+
+    data class Snapshot(val version: String, val geosite: ByteArray, val russianCidrs: List<String>)
 
     fun file(context: Context): File = File(context.noBackupFilesDir, NAME)
 
@@ -35,26 +45,28 @@ internal object GeositeAsset {
         .digest(bytes).joinToString("") { "%02x".format(it) }
 
     @Synchronized
-    fun currentDigest(context: Context): String? = runCatching {
-        sha256(readSnapshot(context))
+    fun currentVersion(context: Context): String? = runCatching {
+        readSnapshot(context).version
     }.getOrNull()
 
     @Synchronized
-    fun readSnapshot(context: Context): ByteArray = AtomicFile(file(context)).openRead().use { input ->
-        require(input.channel.size() in 1024L..MAX_BYTES.toLong()) { "geosite_size_invalid" }
-        input.readBytes().also { require(isValid(it)) { "geosite_invalid" } }
+    fun readSnapshot(context: Context): Snapshot = runCatching {
+        AtomicFile(file(context)).openRead().use(::decodeRelease)
+    }.getOrElse {
+        context.assets.open(NAME).use(::decodeRelease)
     }
 
     @Synchronized
     fun ensureBundledFallback(context: Context) {
-        if (currentDigest(context) != null) return
+        if (runCatching { AtomicFile(file(context)).openRead().use(::decodeRelease) }.isSuccess) return
         val bytes = context.assets.open(NAME).use { it.readBytes() }
         install(context, bytes)
     }
 
     @Synchronized
-    fun install(context: Context, bytes: ByteArray) {
-        require(isValid(bytes)) { "Geosite invalid" }
+    fun install(context: Context, bytes: ByteArray, expectedVersion: String? = null) {
+        val release = ByteArrayInputStream(bytes).use(::decodeRelease)
+        require(expectedVersion == null || release.version == expectedVersion) { "geodata_version_mismatch" }
         val atomic = AtomicFile(file(context))
         val output = atomic.startWrite()
         try {
@@ -64,6 +76,76 @@ internal object GeositeAsset {
             atomic.failWrite(output)
             throw error
         }
+    }
+
+    internal fun decodeRelease(input: InputStream): Snapshot {
+        val entries = mutableMapOf<String, ByteArray>()
+        ZipInputStream(input).use { zip ->
+            while (true) {
+                val entry = zip.nextEntry ?: break
+                val limit = when (entry.name) {
+                    "manifest.json" -> MAX_MANIFEST_BYTES
+                    "geosite.dat", "geoip.dat" -> MAX_BYTES
+                    else -> error("geodata_member_invalid")
+                }
+                require(!entry.isDirectory && entry.name !in entries && entry.size <= limit) { "geodata_member_invalid" }
+                val bytes = ByteArrayOutputStream()
+                val buffer = ByteArray(DEFAULT_BUFFER_SIZE)
+                while (true) {
+                    val count = zip.read(buffer, 0, minOf(buffer.size, limit - bytes.size() + 1))
+                    if (count < 0) break
+                    require(bytes.size() + count <= limit) { "geodata_member_size_invalid" }
+                    bytes.write(buffer, 0, count)
+                }
+                entries[entry.name] = bytes.toByteArray()
+            }
+        }
+        require(entries.size == 3) { "geodata_members_missing" }
+        val manifest = JSONObject(entries.getValue("manifest.json").toString(StandardCharsets.UTF_8))
+        val geosite = entries.getValue("geosite.dat")
+        val geoip = entries.getValue("geoip.dat")
+        fun checkedDigest(name: String, bytes: ByteArray): String {
+            val member = manifest.getJSONObject(name)
+            val digest = sha256(bytes)
+            require(member.getInt("size_bytes") == bytes.size && member.getString("sha256") == digest) {
+                "geodata_checksum_mismatch"
+            }
+            return digest
+        }
+        val version = sha256("${checkedDigest("geosite", geosite)}:${checkedDigest("geoip", geoip)}"
+            .toByteArray(StandardCharsets.US_ASCII))
+        require(manifest.getString("version") == version) { "geodata_version_mismatch" }
+        val russianRule = DomainRulePolicy.RUSSIAN_RESOURCES_RULE
+        val domains = resolveDomains(geosite, setOf(russianRule)).getValue(russianRule)
+        val suffixes = domains.getJSONArray("domain_suffix")
+        require((0 until suffixes.length()).map(suffixes::getString).containsAll(mandatorySuffixes)) {
+            "geodata_russian_suffixes_missing"
+        }
+        return Snapshot(version, geosite, resolveRussianCidrs(geoip))
+    }
+
+    private fun resolveRussianCidrs(bytes: ByteArray): List<String> {
+        val (_, _, category) = fields(bytes, 0, bytes.size).single().also { (field, wire) ->
+            require(field == 1 && wire == 2) { "geoip_list_invalid" }
+        }
+        val entries = fields(bytes, category.first, category.last + 1).toList()
+        val (_, _, code) = entries.single { (field, wire) -> field == 1 && wire == 2 }
+        require(text(bytes, code) == "RU" && entries.all { (field, wire) -> field in 1..2 && wire == 2 }) {
+            "geoip_category_invalid"
+        }
+        return entries.filter { it.first == 2 }.map { (_, _, cidr) ->
+            val parts = fields(bytes, cidr.first, cidr.last + 1).toList()
+            val (_, _, address) = parts.single { (field, wire) -> field == 1 && wire == 2 }
+            val (_, _, prefixRange) = parts.single { (field, wire) -> field == 2 && wire == 0 }
+            val octets = bytes.copyOfRange(address.first, address.last + 1)
+            val prefix = varint(bytes, prefixRange.first, prefixRange.last + 1).first
+            require(parts.size == 2 && octets.size in listOf(4, 16) && prefix in 1L..(8L * octets.size)) {
+                "geoip_cidr_invalid"
+            }
+            val ip = if (octets.size == 4) InetAddress.getByAddress(octets)
+                else Inet6Address.getByAddress(null, octets, -1)
+            "${ip.hostAddress}/$prefix"
+        }.distinct().also { require(it.isNotEmpty()) { "geoip_ru_empty" } }
     }
 
     @Synchronized
@@ -196,11 +278,10 @@ internal object GeositeAsset {
 class GeositeUpdateWorker(context: Context, parameters: WorkerParameters) : CoroutineWorker(context, parameters) {
     override suspend fun doWork(): Result = try {
         val api = BackendApiClient()
-        val metadata = api.geositeMetadata()
-        if (GeositeAsset.currentDigest(applicationContext) != metadata.first) {
-            val bytes = api.downloadGeosite(metadata.second)
-            require(GeositeAsset.sha256(bytes) == metadata.first) { "Geosite checksum mismatch" }
-            GeositeAsset.install(applicationContext, bytes)
+        val metadata = api.geodataMetadata()
+        if (metadata != null && GeositeAsset.currentVersion(applicationContext) != metadata.version) {
+            val bytes = api.downloadGeodata(metadata)
+            GeositeAsset.install(applicationContext, bytes, metadata.version)
         }
         Result.success()
     } catch (cancelled: CancellationException) {

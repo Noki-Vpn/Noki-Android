@@ -139,17 +139,17 @@ class HomeTextPolicyTest {
     }
 
     @Test
-    fun ruServerCardKeepsTheSelectedMultiHopChainAndUsesTheConfirmedExit() {
+    fun ruServerCardIgnoresAnOldMultiHopChainAndUsesTheConfirmedExit() {
         val state = AppUiState(
             advancedSettings = AdvancedSettings(ruRelayEnabled = true, multiHop = MultiHopSettings(
                 enabled = true, entry = HopSelection(ServerSelectionMode.SERVER, nodeId = "entry"),
                 exit = HopSelection(ServerSelectionMode.SERVER, nodeId = "exit"))),
             personalizationSettings = PersonalizationSettings(language = AppLanguage.RU),
             ruForeignNodes = listOf(RuForeignNode("entry", "Латвия1", "LV"), RuForeignNode("exit", "Нидерланды1", "NL")),
-            userProfile = UserProfile(selectedServerCode = "exit"),
+            userProfile = UserProfile(serverSelectionMode = ServerSelectionMode.AUTO, selectedServerCode = "exit"),
         )
-        assertEquals("RU-реле → Латвия1 → Нидерланды1", homeServerSubtitle(state))
-        assertEquals("RU-реле → Латвия1 → Нидерланды1", homeServerSubtitle(state.copy(
+        assertEquals("RU-реле", homeServerSubtitle(state))
+        assertEquals("RU-реле → Нидерланды1", homeServerSubtitle(state.copy(
             connectionState = VpnConnectionState.CONNECTED)))
         val direct = state.copy(advancedSettings = state.advancedSettings.copy(ruRelayEnabled = false),
             locations = listOf(location().copy(servers = listOf(
@@ -177,6 +177,10 @@ class HomeTextPolicyTest {
                 userProfile = UserProfile(serverSelectionMode = ServerSelectionMode.AUTO,
                     selectedServerCode = "old", actualCountryCode = "FR", selectedCountryCode = "FR"),
             )
+            if (ruRelay) {
+                assertNull(homeMultiHopExitCountryCode(state))
+                continue
+            }
             for (connection in listOf(VpnConnectionState.DISCONNECTED, VpnConnectionState.CONNECTING, VpnConnectionState.FAILED)) {
                 assertEquals("NL", homeMultiHopExitCountryCode(state.copy(connectionState = connection)))
             }
@@ -186,7 +190,7 @@ class HomeTextPolicyTest {
             assertNull(homeMultiHopExitCountryCode(state.copy(connectionState = VpnConnectionState.CONNECTED)))
             assertNull(homeMultiHopExitCountryCode(connected.copy(userProfile =
                 state.userProfile.copy(selectedServerCode = "runtime"))))
-            if (!ruRelay) assertEquals("NL", homeMultiHopExitCountryCode(connected.copy(userProfile =
+            assertEquals("NL", homeMultiHopExitCountryCode(connected.copy(userProfile =
                 state.userProfile.copy(selectedServerCode = "nl"))))
             assertNull(homeMultiHopExitCountryCode(connected.copy(userProfile =
                 state.userProfile.copy(selectedServerCode = "missing"))))

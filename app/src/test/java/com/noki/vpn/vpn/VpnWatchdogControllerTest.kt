@@ -20,7 +20,7 @@ class VpnWatchdogControllerTest {
         controller.start(owner, DefaultStoredSettingsFactory.create(), initialVpnEvidence = true)
         controller.forceProbe()
         now = 5_000L
-        controller.resetNetworkEvidence(preserveHealthyEvidence = true)
+        controller.onWake()
         assertEquals(1, cancelled)
         assertEquals(WatchdogProbeOutcome.Ignored, controller.completeProbe(owner, null))
         assertTrue(controller.hasFreshVpnEvidence())
@@ -29,7 +29,74 @@ class VpnWatchdogControllerTest {
     }
 
     @Test
-    fun `manual server never restarts or releases a failing tunnel`() {
+    fun `wake preserves accumulated failures and recovery budget`() {
+        val controller = VpnWatchdogController(
+            WatchdogScheduler(), { 1_000L }, { _, _ -> CancelableTask {} }, { false },
+        )
+        repeat(ConnectedWatchdogPolicy.MAX_RECOVERIES_IN_WINDOW) { index ->
+            val owner = watchdogOwner(30L + index)
+            controller.start(owner, DefaultStoredSettingsFactory.create(), initialVpnEvidence = true)
+            assertEquals(WatchdogAction.None, failedProbe(controller, owner))
+            controller.onWake()
+            val current = checkNotNull(controller.currentOwner())
+            assertEquals(WatchdogProbeOutcome.Unhealthy(WatchdogAction.Refresh), controller.completeProbe(current, null))
+        }
+        controller.start(watchdogOwner(40L), DefaultStoredSettingsFactory.create(), initialVpnEvidence = true)
+        assertEquals(WatchdogAction.None, failedProbe(controller, checkNotNull(controller.currentOwner())))
+        controller.onWake()
+        assertEquals(WatchdogProbeOutcome.Unhealthy(WatchdogAction.ReleaseOutsideLockdown),
+            controller.completeProbe(checkNotNull(controller.currentOwner()), null))
+    }
+
+    @Test
+    fun `wake confirmation bypasses healthy throttle once even with synchronous completion`() {
+        val scheduler = WatchdogScheduler()
+        var launches = 0
+        lateinit var controller: VpnWatchdogController
+        controller = VpnWatchdogController(scheduler, { 0L }, { owner, _ ->
+            launches++
+            controller.completeProbe(owner, if (launches == 1) null else 25L)
+            CancelableTask {}
+        }, { false })
+        controller.start(watchdogOwner(50L), DefaultStoredSettingsFactory.create(), initialVpnEvidence = true)
+        controller.onWake()
+        assertEquals(1, launches)
+        assertEquals(2_000L, scheduler.nextDelayMillis())
+        scheduler.runPending()
+        assertEquals(2, launches)
+        assertEquals(ConnectedWatchdogPolicy.CHECK_INTERVAL_MS, scheduler.nextDelayMillis())
+        scheduler.runPending()
+        assertEquals(2, launches)
+    }
+
+    @Test
+    fun `stop cancels wake confirmation and ignores synchronous late cancellation result`() {
+        val scheduler = WatchdogScheduler()
+        var launches = 0
+        var cancelledResult: WatchdogProbeOutcome? = null
+        lateinit var controller: VpnWatchdogController
+        controller = VpnWatchdogController(scheduler, { 0L }, { owner, _ ->
+            launches++
+            CancelableTask { cancelledResult = controller.completeProbe(owner, 25L) }
+        }, { false })
+        val old = watchdogOwner(60L)
+        controller.start(old, DefaultStoredSettingsFactory.create(), initialVpnEvidence = false)
+        controller.forceProbe()
+        controller.onWake()
+        assertEquals(WatchdogProbeOutcome.Ignored, cancelledResult)
+        val wakeOwner = checkNotNull(controller.currentOwner())
+        assertEquals(WatchdogProbeOutcome.Unhealthy(WatchdogAction.None), controller.completeProbe(wakeOwner, null))
+        assertEquals(2_000L, scheduler.nextDelayMillis())
+        controller.stop(null)
+        scheduler.runPending()
+        controller.onWake()
+        assertEquals(2, launches)
+        assertEquals(WatchdogProbeOutcome.Ignored, controller.completeProbe(wakeOwner, 25L))
+        assertFalse(controller.hasFreshVpnEvidence())
+    }
+
+    @Test
+    fun `manual server requests bounded recovery after two failures`() {
         for (lockdown in listOf(false, true)) {
             val controller = VpnWatchdogController(
                 scheduler = WatchdogScheduler(), nowMillis = { 1_000L },
@@ -40,7 +107,8 @@ class VpnWatchdogControllerTest {
                 userProfile = it.userProfile.copy(serverSelectionMode = com.noki.vpn.data.ServerSelectionMode.SERVER),
             ) }
             controller.start(owner, settings, initialVpnEvidence = false)
-            repeat(10) { assertEquals(WatchdogAction.None, failedProbe(controller, owner)) }
+            assertEquals(WatchdogAction.None, failedProbe(controller, owner))
+            assertEquals(WatchdogAction.Refresh, failedProbe(controller, owner))
             assertEquals(owner, controller.currentOwner())
             controller.forceProbe()
             assertEquals(WatchdogProbeOutcome.Healthy, controller.completeProbe(owner, 30L))
@@ -233,10 +301,10 @@ class VpnWatchdogControllerTest {
 }
 
 private class WatchdogScheduler : DelayedTaskScheduler {
-    private val pending = mutableMapOf<Any, () -> Unit>()
+    private val pending = mutableMapOf<Any, Pair<Long, () -> Unit>>()
 
     override fun schedule(owner: Any, delayMillis: Long, task: () -> Unit) {
-        pending[owner] = task
+        pending[owner] = delayMillis to task
     }
 
     override fun cancel(owner: Any) {
@@ -246,6 +314,8 @@ private class WatchdogScheduler : DelayedTaskScheduler {
     fun runPending() {
         val tasks = pending.values.toList()
         pending.clear()
-        tasks.forEach { it() }
+        tasks.forEach { it.second() }
     }
+
+    fun nextDelayMillis(): Long? = pending.values.singleOrNull()?.first
 }

@@ -94,27 +94,26 @@ internal class SettingsMutationCoordinator(
         }
     }
 
-    private fun StoredSettings.withUiFields(state: AppUiState): StoredSettings =
-        copy(
+    private fun StoredSettings.withUiFields(state: AppUiState): StoredSettings {
+        val nextAdvanced = RuntimeProfilePolicy.normalizeRouteModes(state.advancedSettings)
+        val routeChanged = advancedSettings.ruRelaySelection != nextAdvanced.ruRelaySelection ||
+            advancedSettings.multiHop != nextAdvanced.multiHop ||
+            advancedSettings.gamingModeEnabled != nextAdvanced.gamingModeEnabled
+        val updated = copy(
             filterMode = state.filterMode,
             selectedPackages = state.selectedPackages,
             personalizationSettings = state.personalizationSettings,
             securitySettings = state.securitySettings,
-            advancedSettings = state.advancedSettings,
-            ruRelaySelectionRevision = if (advancedSettings.ruRelaySelection != state.advancedSettings.ruRelaySelection ||
-                advancedSettings.multiHop != state.advancedSettings.multiHop ||
-                advancedSettings.gamingModeEnabled != state.advancedSettings.gamingModeEnabled) {
+            advancedSettings = nextAdvanced,
+            ruRelaySelectionRevision = if (routeChanged) {
                 ruRelaySelectionRevision + 1L
             } else {
                 ruRelaySelectionRevision
             },
-        ).let { updated ->
-            if (advancedSettings.multiHop == state.advancedSettings.multiHop &&
-                advancedSettings.ruRelaySelection == state.advancedSettings.ruRelaySelection &&
-                advancedSettings.gamingModeEnabled == state.advancedSettings.gamingModeEnabled) updated
-            else updated.copy(
-                profile = RuntimeProfilePolicy.profileAfterServerSelection(profile),
-                endpointOptions = emptyList(),
-            )
-        }
+        )
+        return if (routeChanged) updated.copy(
+            profile = RuntimeProfilePolicy.profileAfterServerSelection(profile),
+            endpointOptions = emptyList(),
+        ) else updated
+    }
 }

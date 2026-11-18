@@ -2,11 +2,7 @@ package com.noki.vpn
 
 import com.noki.vpn.data.clientLatencyTargetKey
 import com.noki.vpn.data.ServerLocation
-import com.noki.vpn.data.VpnServer
-import com.noki.vpn.data.HopSelection
-import com.noki.vpn.data.MultiHopSettings
 import com.noki.vpn.data.RuForeignNode
-import com.noki.vpn.data.ServerSelectionMode
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotEquals
@@ -23,33 +19,11 @@ class ClientLatencyRequestTargetTest {
     }
 
     @Test
-    fun `relay latency belongs to the exact explicit entry exit tuple`() {
-        val entryA = "11111111-1111-4111-8111-111111111111"
-        val entryB = "22222222-2222-4222-8222-222222222222"
-        val exit = "33333333-3333-4333-8333-333333333333"
-        val server = VpnServer(exit, "Exit", "LV", "lv", "exit.example", 443, true,
-            multiHopExitAvailable = true)
-        val locations = listOf(location("lv", "lv.example").copy(servers = listOf(server,
-            server.copy(id = "44444444-4444-4444-8444-444444444444", name = "Other"))))
-        val nodes = listOf(RuForeignNode(exit, "Exit", "LV"),
-            RuForeignNode("44444444-4444-4444-8444-444444444444", "Other", "NL"))
-        fun chain(entry: String) = MultiHopSettings(true,
-            HopSelection(ServerSelectionMode.SERVER, nodeId = entry),
-            HopSelection(ServerSelectionMode.SERVER, nodeId = exit))
-
-        val first = clientLatencyRequestTarget(emptyList(), true, chain(entryA), nodes)
-        assertEquals(1, first.size)
-        assertNotEquals(first, clientLatencyRequestTarget(emptyList(), true, chain(entryB), nodes))
-        assertNotEquals(first, clientLatencyRequestTarget(emptyList(), true, foreignNodes = nodes))
-        assertEquals(clientLatencyRequestTarget(locations), clientLatencyRequestTarget(locations, false, chain(entryA)))
-        assertEquals(clientLatencyRequestTarget(locations),
-            clientLatencyRequestTarget(locations, false, MultiHopSettings(enabled = true)))
-        assertTrue(clientLatencyRequestTarget(locations, true, chain(exit)).isEmpty())
-        assertTrue(clientLatencyRequestTarget(locations, true,
-            chain(entryA).copy(exit = HopSelection(ServerSelectionMode.COUNTRY, countryCode = "LV"))).isEmpty())
-        assertTrue(clientLatencyRequestTarget(locations, true,
-            chain(entryA).copy(exit = HopSelection(ServerSelectionMode.SERVER,
-                nodeId = "55555555-5555-4555-8555-555555555555")), nodes).isEmpty())
+    fun `relay latency belongs to distinct available exits`() {
+        val nodes = listOf(RuForeignNode("exit-b", "Other", "NL"), RuForeignNode("exit-a", "Exit", "LV"))
+        assertEquals(listOf("ru:1:exit-a", "ru:1:exit-b"),
+            clientLatencyRequestTarget(emptyList(), true, nodes + nodes.first()))
+        assertTrue(clientLatencyRequestTarget(emptyList(), true).isEmpty())
     }
 
     @Test

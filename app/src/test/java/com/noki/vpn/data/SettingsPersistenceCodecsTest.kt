@@ -48,7 +48,8 @@ class SettingsPersistenceCodecsTest {
             val restored = settingsCodec.decode(legacy)
             assertFalse(restored.advancedSettings.youtubeNoAdsEnabled)
             assertFalse(org.json.JSONObject(settingsCodec.encode(saved)).getBoolean("youtubeDirectDpiEnabled"))
-            assertEquals(advanced.copy(youtubeNoAdsEnabled = false), restored.advancedSettings)
+            assertEquals(RuntimeProfilePolicy.normalizeRouteModes(advanced).copy(youtubeNoAdsEnabled = false),
+                restored.advancedSettings)
         }
     }
 
@@ -242,7 +243,7 @@ class SettingsPersistenceCodecsTest {
     }
 
     @Test
-    fun `explicit RU multiHop intent and direct preferences survive process storage round trip`() {
+    fun `legacy RU conflict keeps the saved pair disabled and persists the migration`() {
         val selection = MultiHopSettings(true,
             HopSelection(ServerSelectionMode.SERVER, nodeId = "11111111-1111-4111-8111-111111111111"),
             HopSelection(ServerSelectionMode.SERVER, nodeId = "22222222-2222-4222-8222-222222222222"))
@@ -250,9 +251,14 @@ class SettingsPersistenceCodecsTest {
             advancedSettings = defaults.advancedSettings.copy(multiHop = selection, ruRelayEnabled = true,
                 protocol = VpnProtocol.REALITY, manualEndpointGroupKey = "saved-direct-group"),
         )
-        val restored = settingsCodec.decode(settingsCodec.encode(stored))
-        assertEquals(selection, restored.advancedSettings.multiHop)
-        assertEquals(selection.explicitNodeIds(), restored.advancedSettings.multiHop.explicitNodeIds())
+        val normalized = settingsCodec.encode(stored)
+        assertEquals(selection.copy(enabled = false), settingsCodec.decode(normalized).advancedSettings.multiHop)
+        val legacy = org.json.JSONObject(normalized)
+        legacy.getJSONObject("multiHopSettings").put("enabled", true)
+        var saved: StoredSettings? = null
+        val restored = settingsCodec.decode(legacy.toString()) { saved = it }
+        assertEquals(selection.copy(enabled = false), restored.advancedSettings.multiHop)
+        assertEquals(restored, saved)
         assertTrue(restored.advancedSettings.ruRelayEnabled)
         assertEquals(VpnProtocol.REALITY, restored.advancedSettings.protocol)
         assertEquals("saved-direct-group", restored.advancedSettings.manualEndpointGroupKey)

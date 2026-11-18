@@ -73,6 +73,284 @@ import org.robolectric.annotation.LooperMode
 @Config(sdk = [28])
 @LooperMode(LooperMode.Mode.PAUSED)
 class AppVpnServiceCommandTest {
+    @OptIn(kotlinx.coroutines.ExperimentalCoroutinesApi::class)
+    @Test fun coldEntryRouteKeepsLateNativeAckWithinTheSharedStartDeadline() = kotlinx.coroutines.test.runTest {
+        val fixture = Fixture(this)
+        fixture.setNetworkAvailability(UnderlyingNetworkAvailability.Validated)
+        val entered = java.util.concurrent.CountDownLatch(1)
+        val release = java.util.concurrent.CountDownLatch(1)
+        val completed = java.util.concurrent.CountDownLatch(1)
+        fixture.entryRouteProbe = VpnReadinessProbe(measure = {
+            entered.countDown()
+            try {
+                check(release.await(5, java.util.concurrent.TimeUnit.SECONDS))
+                VpnProbeResult(9_000L)
+            } finally { completed.countDown() }
+        }, cancel = { release.countDown() })
+        val deadline = android.os.SystemClock.elapsedRealtime() + 30_000L
+        val selection = async { fixture.selectEntryRoute("11111111-1111-4111-8111-111111111111", true, deadline) }
+        try {
+            testScheduler.runCurrent()
+            assertTrue(entered.await(5, java.util.concurrent.TimeUnit.SECONDS))
+            org.robolectric.shadows.ShadowSystemClock.advanceBy(java.time.Duration.ofMillis(9_000L))
+            testScheduler.advanceTimeBy(9_000L)
+            testScheduler.runCurrent()
+            assertFalse("Cold enrollment must retain the native third ACK window", selection.isCompleted)
+            release.countDown()
+            assertTrue(completed.await(5, java.util.concurrent.TimeUnit.SECONDS))
+            val wallDeadline = System.nanoTime() + java.util.concurrent.TimeUnit.SECONDS.toNanos(5)
+            while (!selection.isCompleted && System.nanoTime() < wallDeadline) {
+                testScheduler.runCurrent()
+                Thread.yield()
+            }
+            assertTrue(selection.isCompleted)
+            assertEquals(9_000L, selection.await())
+            assertEquals(listOf(true), fixture.entryRouteEnrollments)
+        } finally { release.countDown(); selection.cancel() }
+    }
+    @Test
+    fun oldServiceCleanupClosesItsTunnelWithoutPublishingOverTheReplacement() = runBlocking {
+        val old = Fixture(this)
+        var oldTunnelClosed = false
+        old.orchestrator.replaceTunnel(object : TunHandle {
+            override val fd = 11
+            override fun close() { oldTunnelClosed = true }
+        })
+        val replacement = Fixture(this)
+        replacement.set("connectedAtMillis", 1234L)
+        replacement.publishState(VpnConnectionState.CONNECTED)
+        val broadcastsBefore = shadowOf(replacement.service).broadcastIntents.size
+        val preferences = SettingsRepository(replacement.service).let { repository ->
+            SettingsRepository::class.java.getDeclaredField("preferences").apply { isAccessible = true }
+                .get(repository) as android.content.SharedPreferences
+        }
+        preferences.edit().putString("vpn_runtime_state", "replacement").commit()
+
+        old.orchestrator.withLifecycleLock { old.releaseResources() }
+
+        assertTrue(oldTunnelClosed)
+        assertTrue(old.runtimeStops > 0)
+        assertEquals(VpnConnectionState.CONNECTED, AppVpnService.liveRuntimeState().state)
+        assertEquals(1234L, AppVpnService.liveRuntimeState().connectedAtMillis)
+        assertEquals("replacement", preferences.getString("vpn_runtime_state", null))
+        assertEquals(broadcastsBefore, shadowOf(replacement.service).broadcastIntents.size)
+    }
+
+    @Test
+    fun oldServiceCannotRollbackRuntimeDomainsAfterTheReplacementOwnsSettings() {
+        val old = Fixture(CoroutineScope(SupervisorJob()))
+        val previous = old.savedSettings()
+        val candidate = previous.copy(advancedSettings = previous.advancedSettings.copy(
+            alwaysOnDomains = listOf("domain:example.test"),
+        ))
+        val replacement = Fixture(CoroutineScope(SupervisorJob()))
+        replacement.saveSettings(candidate)
+
+        old.invoke("restoreRuntimeDomainSettings", SettingsRepository(old.service), previous, candidate)
+
+        assertEquals(candidate.advancedSettings.alwaysOnDomains,
+            SettingsRepository(replacement.service).load().advancedSettings.alwaysOnDomains)
+    }
+
+    @Test
+    fun ruStartWithoutAnUnderlayRegistersRecoveryBeforeWaiting() = runBlocking {
+        val fixture = Fixture(this)
+        fixture.enableRuStartup()
+        fixture.orchestrator.updateState(VpnConnectionState.DISCONNECTED)
+        fixture.orchestrator.replaceTunnel(null)
+        fixture.setNetworkAvailability(UnderlyingNetworkAvailability.None)
+        val callbacks = fixture.recordNetworkRegistrations()
+
+        fixture.startAccount()
+        fixture.orchestrator.activeTransitionJob()?.join()
+
+        assertTrue(callbacks.isNotEmpty())
+        assertEquals(VpnConnectionState.CONNECTING, fixture.orchestrator.currentState())
+        assertNotNull(fixture.pendingNetworkRecovery())
+        assertEquals(0, fixture.ruBackendCalls)
+    }
+
+    @Test
+    fun ruConnectingLossCancelsTheOldAttemptAndKeepsRecoveryOnTheReplacementMonitor() = runBlocking {
+        val fixture = Fixture(this)
+        fixture.enableRuStartup()
+        fixture.setNetworkAvailability(UnderlyingNetworkAvailability.Validated)
+        fixture.orchestrator.updateUnderlay(AndroidUnderlyingNetworkSource(fixture.service).currentSnapshot())
+        fixture.orchestrator.updateState(VpnConnectionState.CONNECTING)
+        val callbacks = fixture.recordNetworkRegistrations()
+        val old = fixture.orchestrator.launchTransition(this, VpnConnectionOperation.CONNECTION,
+            onError = { _, error -> throw error }) { awaitCancellation() }
+        yield()
+        try {
+            fixture.observeNetwork(UnderlyingNetworkAvailability.None)
+            assertTrue("loss must cancel the startup rather than wait for its probe timeout", old.isCancelled)
+            fixture.orchestrator.activeTransitionJob()?.join()
+            assertEquals(VpnConnectionState.CONNECTING, fixture.orchestrator.currentState())
+            assertNotNull(fixture.pendingNetworkRecovery())
+            assertTrue(callbacks.isNotEmpty())
+            assertEquals(0, fixture.runtimeRebinds)
+            assertEquals(0, fixture.ruBackendCalls)
+        } finally {
+            old.cancel()
+            fixture.orchestrator.activeTransitionJob()?.cancel()
+        }
+    }
+
+    @Test
+    fun ruRegistrationGapIsSampledAndANewerStopRejectsTheOldAvailableCallback() = runBlocking {
+        val fixture = Fixture(this)
+        fixture.enableRuStartup()
+        fixture.orchestrator.updateState(VpnConnectionState.DISCONNECTED)
+        fixture.orchestrator.replaceTunnel(null)
+        fixture.setNetworkAvailability(UnderlyingNetworkAvailability.Validated)
+        var firstRegistration = true
+        val callbacks = fixture.recordNetworkRegistrations {
+            if (firstRegistration) {
+                firstRegistration = false
+                fixture.setNetworkAvailability(UnderlyingNetworkAvailability.None)
+            }
+        }
+
+        fixture.startAccount()
+        yield()
+        fixture.orchestrator.activeTransitionJob()?.join()
+        assertTrue("initial snapshot must be read after registration", callbacks.isNotEmpty())
+        assertEquals(VpnConnectionState.CONNECTING, fixture.orchestrator.currentState())
+        assertNotNull(fixture.pendingNetworkRecovery())
+        assertEquals(0, fixture.ruBackendCalls)
+        val oldAvailableCallback = callbacks.last()
+
+        fixture.stop(17)
+        fixture.orchestrator.activeTransitionJob()?.join()
+        val stoppedGeneration = fixture.orchestrator.currentGenerationId()
+        fixture.setNetworkAvailability(UnderlyingNetworkAvailability.Validated)
+        oldAvailableCallback()
+        shadowOf(Looper.getMainLooper()).idle()
+
+        assertEquals(stoppedGeneration, fixture.orchestrator.currentGenerationId())
+        assertEquals(VpnConnectionState.DISCONNECTED, fixture.orchestrator.currentState())
+        assertNull(fixture.pendingNetworkRecovery())
+        assertEquals(callbacks.size, fixture.networkRegistrationsClosed)
+        assertEquals(0, fixture.ruBackendCalls)
+    }
+
+    @Test
+    fun theInitialSelectedRuNetworkDoesNotRestartTheConnectingAttempt() = runBlocking {
+        val fixture = Fixture(this)
+        fixture.enableRuStartup()
+        fixture.setNetworkAvailability(UnderlyingNetworkAvailability.Validated)
+        fixture.orchestrator.updateState(VpnConnectionState.CONNECTING)
+        fixture.orchestrator.updateUnderlay(AndroidUnderlyingNetworkSource(fixture.service).currentSnapshot())
+        val generation = fixture.orchestrator.beginTransition()
+
+        fixture.observeNetwork(UnderlyingNetworkAvailability.Validated)
+
+        assertEquals(generation, fixture.orchestrator.currentGenerationId())
+        assertNull(fixture.orchestrator.activeTransitionJob())
+        assertEquals(0, fixture.runtimeRebinds)
+    }
+
+    @Test
+    fun pendingRuRecoveryResumesOnceAndStopCancelsTheQueuedRestart() = runBlocking {
+        val fixture = Fixture(this)
+        fixture.enableRuStartup()
+        fixture.orchestrator.updateState(VpnConnectionState.DISCONNECTED)
+        fixture.orchestrator.replaceTunnel(null)
+        fixture.setNetworkAvailability(UnderlyingNetworkAvailability.None)
+        val callbacks = fixture.recordNetworkRegistrations()
+        fixture.startAccount()
+        fixture.orchestrator.activeTransitionJob()?.join()
+        assertNotNull(fixture.pendingNetworkRecovery())
+        val waitingGeneration = fixture.orchestrator.currentGenerationId()
+        fixture.orchestrator.lifecycleMutex.lock()
+        try {
+            fixture.setNetworkAvailability(UnderlyingNetworkAvailability.Validated, networkId = 102)
+            callbacks.last()()
+            shadowOf(Looper.getMainLooper()).idleFor(java.time.Duration.ofMillis(1))
+            val resumedGeneration = fixture.orchestrator.currentGenerationId()
+            assertEquals(waitingGeneration + 1, resumedGeneration)
+            assertNull(fixture.pendingNetworkRecovery())
+            callbacks.last()()
+            shadowOf(Looper.getMainLooper()).idleFor(java.time.Duration.ofMillis(1))
+            assertEquals(resumedGeneration, fixture.orchestrator.currentGenerationId())
+            fixture.stop(18)
+        } finally {
+            fixture.orchestrator.lifecycleMutex.unlock()
+            fixture.orchestrator.activeTransitionJob()?.join()
+        }
+        assertEquals(VpnConnectionState.DISCONNECTED, fixture.orchestrator.currentState())
+        assertNull(fixture.pendingNetworkRecovery())
+        assertEquals(callbacks.size, fixture.networkRegistrationsClosed)
+        assertEquals(0, fixture.ruBackendCalls)
+    }
+
+    @Test
+    fun replacementOfTheSelectedRuNetworkCancelsStartupWithoutRebindingIt() = runBlocking {
+        val fixture = Fixture(this)
+        fixture.enableRuStartup()
+        fixture.setNetworkAvailability(UnderlyingNetworkAvailability.Validated, networkId = 101)
+        fixture.orchestrator.updateUnderlay(AndroidUnderlyingNetworkSource(fixture.service).currentSnapshot())
+        fixture.orchestrator.updateState(VpnConnectionState.CONNECTING)
+        val old = fixture.orchestrator.launchTransition(this, VpnConnectionOperation.CONNECTION,
+            onError = { _, error -> throw error }) { awaitCancellation() }
+        yield()
+        val callbacks = fixture.recordNetworkRegistrations()
+        fixture.invoke("startNetworkChangeMonitor", EndpointRankingPolicy.NetworkKind.OTHER)
+        fixture.orchestrator.lifecycleMutex.lock()
+        try {
+            fixture.setNetworkAvailability(UnderlyingNetworkAvailability.Validated, networkId = 102)
+            callbacks.last()()
+            shadowOf(Looper.getMainLooper()).idleFor(java.time.Duration.ofMillis(1))
+            assertTrue(old.isCancelled)
+            assertEquals(0, fixture.runtimeRebinds)
+            val replacementGeneration = fixture.orchestrator.currentGenerationId()
+            callbacks.last()()
+            shadowOf(Looper.getMainLooper()).idleFor(java.time.Duration.ofMillis(1))
+            assertEquals(replacementGeneration, fixture.orchestrator.currentGenerationId())
+            fixture.stop(19)
+        } finally {
+            old.cancel()
+            fixture.orchestrator.lifecycleMutex.unlock()
+            fixture.orchestrator.activeTransitionJob()?.join()
+        }
+        assertEquals(VpnConnectionState.DISCONNECTED, fixture.orchestrator.currentState())
+        assertEquals(0, fixture.ruBackendCalls)
+    }
+
+    @Test
+    fun backgroundRuNetworkObservationWaitsForMainAndCannotSupersedeStop() = runBlocking {
+        val fixture = Fixture(this)
+        fixture.enableRuStartup()
+        fixture.setNetworkAvailability(UnderlyingNetworkAvailability.Validated)
+        fixture.orchestrator.updateUnderlay(AndroidUnderlyingNetworkSource(fixture.service).currentSnapshot())
+        fixture.orchestrator.updateState(VpnConnectionState.CONNECTING)
+        val old = fixture.orchestrator.launchTransition(this, VpnConnectionOperation.CONNECTION,
+            onError = { _, error -> throw error }) { awaitCancellation() }
+        yield()
+        fixture.recordNetworkRegistrations()
+        fixture.invoke("startNetworkChangeMonitor", EndpointRankingPolicy.NetworkKind.OTHER)
+        val generation = fixture.orchestrator.currentGenerationId()
+        fixture.setNetworkAvailability(UnderlyingNetworkAvailability.None)
+        val backgroundRefresh = Thread { fixture.refreshNetworkMonitor() }
+        backgroundRefresh.start()
+        backgroundRefresh.join()
+        try {
+            assertEquals("IO observation must admit its restart on main", generation,
+                fixture.orchestrator.currentGenerationId())
+            fixture.stop(20)
+            fixture.orchestrator.activeTransitionJob()?.join()
+            val stoppedGeneration = fixture.orchestrator.currentGenerationId()
+            shadowOf(Looper.getMainLooper()).idle()
+            assertEquals(stoppedGeneration, fixture.orchestrator.currentGenerationId())
+            assertEquals(VpnConnectionState.DISCONNECTED, fixture.orchestrator.currentState())
+            assertNull(fixture.pendingNetworkRecovery())
+            assertEquals(0, fixture.ruBackendCalls)
+        } finally {
+            old.cancel()
+            fixture.orchestrator.activeTransitionJob()?.cancel()
+        }
+    }
+
     @Test
     fun requiredClientUpdateFailsBeforeCreatingARuntimeAndBroadcastsUpdateReason() = runBlocking {
         val fixture = Fixture(this)
@@ -122,8 +400,8 @@ class AppVpnServiceCommandTest {
         fixture.startAccount()
         fixture.orchestrator.activeTransitionJob()!!.join()
 
-        val bundled = fixture.service.assets.open("geosite.dat").use { it.readBytes() }
-        assertEquals(GeositeAsset.sha256(bundled), GeositeAsset.currentDigest(fixture.service))
+        val bundled = fixture.service.assets.open("geodata.zip").use(GeositeAsset::decodeRelease)
+        assertEquals(bundled.version, GeositeAsset.currentVersion(fixture.service))
         assertEquals(emptyList<String>(), fixture.startedEndpoints)
         assertEquals(0, fixture.tunnelsCreated)
     }
@@ -210,7 +488,7 @@ class AppVpnServiceCommandTest {
     @Test
     fun ruNotificationKeepsConfirmedExitAcrossSharedSettingsActivation() = runBlocking {
         val fixture = Fixture(this)
-        fixture.useRuSession(ruSession(System.currentTimeMillis() + 3_600_000L)) { 503 to "{}" }
+        fixture.useRuSession(ruSession(System.currentTimeMillis() + 3_600_000L))
         val settings = fixture.savedSettings().let { it.copy(profile = it.profile.copy(remark = "Noki Латвия6")) }
         fixture.set("notificationServerLabel", "Латвия7")
         fixture.finishConnectedSettings(settings)
@@ -228,7 +506,7 @@ class AppVpnServiceCommandTest {
     fun ruNetworkLossAndReturnRebindTheSameRuntimeAndTunnel() = runBlocking {
         val fixture = Fixture(this)
         val session = ruSession(System.currentTimeMillis() + 3_600_000L)
-        fixture.useRuSession(session) { error("Network handover must not prepare or renew a session") }
+        fixture.useRuSession(session)
         val tunnel = fixture.orchestrator.currentTunnel()
         val generation = fixture.orchestrator.currentGenerationId()
         fixture.orchestrator.updateUnderlay(UnderlyingNetworkSnapshot(
@@ -247,7 +525,7 @@ class AppVpnServiceCommandTest {
             fixture.orchestrator.withLifecycleLock {}
             assertEquals(tunnel, fixture.orchestrator.currentTunnel())
             assertEquals(generation, fixture.orchestrator.currentGenerationId())
-            assertEquals(session, fixture.ruSession())
+            org.junit.Assert.assertNotNull(fixture.ruSession())
             assertEquals(0, fixture.runtimeStops)
             assertEquals(0, fixture.tunnelsCreated)
             assertEquals(emptyList<String>(), fixture.startedEndpoints)
@@ -258,9 +536,7 @@ class AppVpnServiceCommandTest {
     @Test
     fun ruFailedSocketRebindRetriesWithoutRestartingTheCore() = runBlocking {
         val fixture = Fixture(this)
-        fixture.useRuSession(ruSession(System.currentTimeMillis() + 3_600_000L)) {
-            error("Socket recovery must not prepare or renew a session")
-        }
+        fixture.useRuSession(ruSession(System.currentTimeMillis() + 3_600_000L))
         val tunnel = fixture.orchestrator.currentTunnel()
         fixture.runtimeRebindSucceeds = false
         try {
@@ -281,10 +557,10 @@ class AppVpnServiceCommandTest {
     }
 
     @Test
-    fun ruSocketRebindDoesNotRepeatWhenHttpReadinessFails() = runBlocking {
+    fun ruSocketRebindKeepsTunnelWhenLocalRouteIsAcknowledged() = runBlocking {
         val fixture = Fixture(this)
         val session = ruSession()
-        fixture.useRuSession(session) { 503 to "{}" }
+        fixture.useRuSession(session)
         fixture.workingEndpoint = null
         var probes = 0
         fixture.onProbe = { probes++ }
@@ -299,7 +575,7 @@ class AppVpnServiceCommandTest {
             org.junit.Assert.assertNotNull(fixture.orchestrator.currentUnderlay())
             assertEquals(tunnel, fixture.orchestrator.currentTunnel())
             assertEquals(generation, fixture.orchestrator.currentGenerationId())
-            assertEquals(session, fixture.ruSession())
+            org.junit.Assert.assertNotNull(fixture.ruSession())
             assertEquals(true, fixture.runtimeRunning)
             assertEquals(0, fixture.runtimeStops)
             assertEquals(emptyList<String>(), fixture.startedEndpoints)
@@ -312,7 +588,7 @@ class AppVpnServiceCommandTest {
             org.junit.Assert.assertNotNull(fixture.orchestrator.currentUnderlay())
             assertEquals(tunnel, fixture.orchestrator.currentTunnel())
             assertEquals(generation, fixture.orchestrator.currentGenerationId())
-            assertEquals(session, fixture.ruSession())
+            org.junit.Assert.assertNotNull(fixture.ruSession())
             assertEquals(true, fixture.runtimeRunning)
             assertEquals(0, fixture.runtimeStops)
             assertEquals(0, fixture.tunnelsCreated)
@@ -346,80 +622,22 @@ class AppVpnServiceCommandTest {
     }
 
     @Test
-    fun persistentRuStatusPreservesWorkingTunnelAndNeverRenews() = runBlocking {
+    fun ruLocalCredentialExpiryFailsClosedWithoutAPoll() = runBlocking {
         val fixture = Fixture(this)
-        val session = ruSession()
-        val tunnel = fixture.orchestrator.currentTunnel()
-        val requests = mutableListOf<okhttp3.Request>()
-        fixture.useRuSession(session) { request ->
-            requests += request
-            200 to ruSessionJson(session)
-        }
+        fixture.useRuSession(ruSession(System.currentTimeMillis() - 1L))
         fixture.checkRuStatus()
-        assertEquals(listOf("GET"), requests.map { it.method })
-        assertEquals("/v1/vpn/sessions/${session.identity.sessionId}", requests.single().url.encodedPath)
-        assertEquals(tunnel, fixture.orchestrator.currentTunnel())
-        assertEquals(VpnConnectionState.CONNECTED, fixture.orchestrator.currentState())
-        assertEquals(0, fixture.runtimeStops)
-    }
-
-    @Test
-    fun persistentRuRevocationFailsClosedButTransientStatusDoesNot() = runBlocking {
-        for (status in listOf(503, 409)) {
-            val fixture = Fixture(this)
-            fixture.useRuSession(ruSession()) { status to "{\"detail\":\"test\"}" }
-            fixture.checkRuStatus()
-            if (status == 503) {
-                assertEquals(VpnConnectionState.CONNECTED, fixture.orchestrator.currentState())
-                assertEquals(0, fixture.runtimeStops)
-            } else {
-                assertEquals(VpnConnectionState.FAILED, fixture.orchestrator.currentState())
-                assertNull(fixture.ruSession())
-                assertEquals(1, fixture.runtimeStops)
-            }
-        }
-    }
-
-    @Test
-    fun persistentRuUpdateRequirementRevokesAdmissionAndBroadcastsUpdateReason() = runBlocking {
-        val fixture = Fixture(this)
-        val session = ruSession()
-        fixture.useRuSession(session) { 426 to "{\"detail\":\"client_update_required\"}" }
-
-        fixture.checkRuStatus()
-
         assertEquals(VpnConnectionState.FAILED, fixture.orchestrator.currentState())
         assertNull(fixture.ruSession())
         assertEquals(1, fixture.runtimeStops)
-        assertNull(fixture.orchestrator.currentTunnel())
-        val failure = shadowOf(fixture.service).broadcastIntents.last {
-            it.action == AppVpnService.ACTION_STATE_CHANGED &&
-                it.getStringExtra(AppVpnService.EXTRA_STATE) == VpnConnectionState.FAILED.name
-        }
-        assertEquals("client_update_required", failure.getStringExtra(AppVpnService.EXTRA_REASON))
     }
 
     @Test
-    fun persistentRuReadyCannotRegressToPending() = runBlocking {
+    fun ruDisconnectKeepsRenewableEntryCredentialAndDoesNotStageSessionRevoke() = runBlocking {
         val fixture = Fixture(this)
-        val ready = ruSession()
-        val pending = ready.copy(identity = ready.identity.copy(
-            leaseExpiresAtEpochMillis = System.currentTimeMillis() + 60_000L))
-        fixture.useRuSession(ready) { 202 to ruSessionJson(pending, ready = false) }
-        fixture.checkRuStatus()
-        assertEquals(VpnConnectionState.FAILED, fixture.orchestrator.currentState())
-        assertNull(fixture.ruSession())
-    }
-
-    @Test
-    fun persistentRuStopStagesExactSessionRevokeBeforeNextStart() = runBlocking {
-        val fixture = Fixture(this)
-        val first = ruSession()
-        fixture.useRuSession(first) { 200 to ruSessionJson(first) }
+        fixture.useRuSession(ruSession())
         fixture.stop(1)
         fixture.orchestrator.activeTransitionJob()?.join()
-        val pending = SettingsRepository(fixture.service).loadPendingRuWireGuardRevokes().singleOrNull()
-        assertEquals(first.identity.sessionId, pending?.sessionId)
+        assertTrue(SettingsRepository(fixture.service).loadPendingRuWireGuardRevokes().isEmpty())
         assertNull(fixture.ruSession())
         assertEquals(VpnConnectionState.DISCONNECTED, fixture.orchestrator.currentState())
     }
@@ -497,27 +715,6 @@ class AppVpnServiceCommandTest {
         BackendRuWireGuardConfig("192.0.2.1:51820", java.util.Base64.getEncoder().encodeToString(ByteArray(32) { 7 }),
             "10.87.0.2/32", listOf("1.1.1.1"), 1280, listOf("0.0.0.0/0")),
     )
-
-    private fun ruSessionJson(session: BackendRuWireGuardSession.Ready, ready: Boolean = true): String {
-        val id = session.identity
-        val config = session.wireguard
-        return JSONObject().put("engine", "wireguard").put("contract_version", 2).put("route_mode", "ru_wg_nebula")
-            .put("status", if (ready) "ready" else "pending").put("request_id", id.requestId)
-            .put("session_id", id.sessionId).put("generation", id.generation).put("public_key_id", id.publicKeyId)
-            .put("relay_selection", JSONObject().put("kind", "auto")).put("relay_node_id", id.relayNodeId)
-            .put("exit_node_id", id.exitNodeId)
-            .put("route_version", id.routeVersion).put("route_id", id.routeId)
-            .put("route_generation", id.routeGeneration).put("entry_node_id", id.entryNodeId ?: JSONObject.NULL)
-            .put("revoke_token", id.revokeToken)
-            .put("lease_expires_at", if (ready) JSONObject.NULL else
-                java.time.Instant.ofEpochMilli(requireNotNull(id.leaseExpiresAtEpochMillis)).toString())
-            .apply { if (ready) {
-                put("wireguard", JSONObject().put("endpoint", config.endpoint)
-                    .put("server_public_key", config.serverPublicKey).put("address", config.address)
-                    .put("dns", org.json.JSONArray(config.dns)).put("mtu", config.mtu)
-                    .put("allowed_ips", org.json.JSONArray(config.allowedIps)))
-            } }.toString()
-    }
 
     @Test
     fun candidateWarmupRespectsProtocolAndManualSelection() = runBlocking {
@@ -727,16 +924,12 @@ class AppVpnServiceCommandTest {
     @Test
     fun coreAssetRefreshReplacesEqualLengthDataAndPreservesOldFileOnFailure() {
         val context = Fixture(kotlinx.coroutines.CoroutineScope(kotlinx.coroutines.Dispatchers.Unconfined)).service
-        val asset = context.assets.open("geosite.dat").use { it.readBytes() }
-        val target = java.io.File(context.noBackupFilesDir, "geosite.dat")
+        val asset = context.assets.open("geodata.zip").use { it.readBytes() }
+        val target = GeositeAsset.file(context)
         target.writeBytes(ByteArray(asset.size))
         GeositeAsset.ensureBundledFallback(context)
         org.junit.Assert.assertArrayEquals(asset, target.readBytes())
-        val updated = GeositeAssetTest.asset(
-            "CATEGORY-RU" to listOf(GeositeAssetTest.domain(2, "ru.example")),
-            "ADDED-CATEGORY" to listOf(GeositeAssetTest.domain(2, "added.example")),
-        )
-        org.junit.Assert.assertTrue(GeositeAsset.isValid(updated))
+        val updated = GeositeAssetTest.release("added.example")
         GeositeAsset.install(context, updated)
         GeositeAsset.ensureBundledFallback(context)
         org.junit.Assert.assertArrayEquals(updated, target.readBytes())
@@ -903,9 +1096,12 @@ class AppVpnServiceCommandTest {
     }
 
     @Test
-    fun healthyCachedStartDoesNotScheduleASelectionRefresh(): Unit = runBlocking {
+    fun healthyExplicitServerCachedStartDoesNotScheduleASelectionRefresh(): Unit = runBlocking {
         val fixture = Fixture(this, probeFallback = true, workingEndpoint = "tcp1")
-        fixture.startPrepared(EndpointSelectionMode.MANUAL)
+        val node = "11111111-1111-4111-8111-111111111111"
+        fixture.startPrepared(EndpointSelectionMode.MANUAL, nodeId = node)
+        fixture.saveSettings(fixture.savedSettings().let { it.copy(userProfile = it.userProfile.copy(
+            serverSelectionMode = com.noki.vpn.data.ServerSelectionMode.SERVER, selectedNodeId = node)) })
         val requests = java.util.concurrent.atomic.AtomicInteger()
         fixture.useOfflinePreparation(onPrepare = { requests.incrementAndGet() })
         fixture.stop(1)
@@ -1055,7 +1251,7 @@ class AppVpnServiceCommandTest {
         val workers = kotlinx.coroutines.SupervisorJob()
         val scope = CoroutineScope(workers + kotlinx.coroutines.Dispatchers.IO)
         val fixture = Fixture(scope)
-        fixture.useRuSession(ruSession()) { 503 to "{}" }
+        fixture.useRuSession(ruSession())
         val entered = java.util.concurrent.CountDownLatch(1)
         val release = java.util.concurrent.CountDownLatch(1)
         fixture.onProbe = {
@@ -1144,29 +1340,47 @@ class AppVpnServiceCommandTest {
     }
 
     @Test
-    fun failedWakeHttpProbesDoNotResetSocketsOrSelectAnotherServer(): Unit = runBlocking {
+    fun failedWakeConfirmsAfterTwoSecondsAndRecoversTheSelectedServer(): Unit = runBlocking {
         val fixture = Fixture(this, probeFallback = true, workingEndpoint = "tcp1", realSidecars = true)
         fixture.setNetworkAvailability(UnderlyingNetworkAvailability.Validated)
-        fixture.startPrepared(EndpointSelectionMode.MANUAL)
+        val selectedNode = "11111111-1111-4111-8111-111111111111"
+        fixture.startPrepared(EndpointSelectionMode.MANUAL, nodeId = selectedNode)
+        fixture.useOfflinePreparation(BackendException("selected server unavailable", 403))
+        val settings = fixture.savedSettings().let { it.copy(userProfile = it.userProfile.copy(
+            serverSelectionMode = com.noki.vpn.data.ServerSelectionMode.SERVER, selectedNodeId = selectedNode,
+        )) }
+        fixture.saveSettings(settings)
         val before = fixture.orchestrator.snapshot()
+        fixture.invoke("startConnectedWatchdog", settings, checkNotNull(before.owner))
         val starts = fixture.startedEndpoints.toList()
         val stops = fixture.runtimeStops
+        fixture.watchdogProbes.clear()
         fixture.workingEndpoint = null
         try {
-            repeat(3) {
-                fixture.invoke("handleScreenStateChanged", false)
-                fixture.invoke("handleScreenStateChanged", true)
-                fixture.awaitWakeProbe()
-            }
-            shadowOf(Looper.getMainLooper()).idleFor(java.time.Duration.ofSeconds(10))
-            yield()
-            assertEquals(3, fixture.runtimeWakes)
+            fixture.invoke("handleScreenStateChanged", true)
+            fixture.awaitWakeProbe()
+            assertEquals(listOf(true), fixture.watchdogProbes)
             assertEquals(0, fixture.runtimeRebinds)
             assertEquals(starts, fixture.startedEndpoints)
             assertEquals(stops, fixture.runtimeStops)
             assertEquals(before.owner, fixture.orchestrator.snapshot().owner)
-            assertEquals(before.activeSettings, fixture.orchestrator.currentSettings())
             assertEquals(VpnConnectionState.CONNECTED, fixture.orchestrator.currentState())
+
+            shadowOf(Looper.getMainLooper()).idleFor(java.time.Duration.ofMillis(1_999))
+            yield()
+            assertEquals(1, fixture.watchdogProbes.size)
+            assertEquals(stops, fixture.runtimeStops)
+            shadowOf(Looper.getMainLooper()).idleFor(java.time.Duration.ofMillis(1))
+            fixture.awaitWakeProbe()
+            assertEquals("confirmation must bypass the 120s healthy throttle", 2, fixture.watchdogProbes.size)
+            fixture.orchestrator.activeTransitionJob()?.join()
+            assertEquals(listOf(selectedNode), fixture.preparationSettings.map { it.userProfile.selectedNodeId })
+            assertTrue(fixture.preparationSettings.all {
+                it.userProfile.serverSelectionMode == com.noki.vpn.data.ServerSelectionMode.SERVER
+            })
+            assertEquals(starts, fixture.startedEndpoints)
+            assertEquals(selectedNode, fixture.savedSettings().userProfile.selectedNodeId)
+            assertEquals(VpnConnectionState.FAILED, fixture.orchestrator.currentState())
         } finally { fixture.stop(1); fixture.orchestrator.activeTransitionJob()?.join() }
     }
 
@@ -1185,6 +1399,91 @@ class AppVpnServiceCommandTest {
             assertFalse(watchdog.hasFreshVpnEvidence())
             assertEquals(0, fixture.runtimeRebinds)
         } finally { fixture.stop(1); fixture.orchestrator.activeTransitionJob()?.join() }
+    }
+
+    @Test
+    fun wakeConfirmationCannotRepairAfterSelectionOrProfileChanges(): Unit = runBlocking {
+        for (changeProfile in listOf(false, true)) {
+            val fixture = Fixture(this, probeFallback = true, workingEndpoint = "tcp1", realSidecars = true)
+            fixture.setNetworkAvailability(UnderlyingNetworkAvailability.Validated)
+            fixture.startPrepared(EndpointSelectionMode.MANUAL)
+            val starts = fixture.startedEndpoints.toList()
+            val stops = fixture.runtimeStops
+            val generation = fixture.orchestrator.currentGenerationId()
+            fixture.watchdogProbes.clear()
+            fixture.workingEndpoint = null
+            try {
+                fixture.invoke("handleScreenStateChanged", true)
+                fixture.awaitWakeProbe()
+                fixture.onProbe = {
+                    val runtime = fixture.orchestrator.currentSettings()
+                    val previous = fixture.savedSettings()
+                    fixture.saveSettings(if (changeProfile) previous.copy(
+                        profile = previous.profile.copy(host = "replacement.example"),
+                    ) else previous.copy(userProfile = previous.userProfile.copy(
+                        serverSelectionMode = com.noki.vpn.data.ServerSelectionMode.SERVER,
+                        selectedNodeId = "22222222-2222-4222-8222-222222222222",
+                    )))
+                    fixture.orchestrator.updateSettings(runtime)
+                }
+                shadowOf(Looper.getMainLooper()).idleFor(java.time.Duration.ofSeconds(2))
+                fixture.awaitWakeProbe()
+                yield()
+                fixture.orchestrator.activeTransitionJob()?.join()
+                assertEquals(2, fixture.watchdogProbes.size)
+                assertEquals(generation, fixture.orchestrator.currentGenerationId())
+                assertEquals(starts, fixture.startedEndpoints)
+                assertEquals(stops, fixture.runtimeStops)
+                assertTrue(fixture.preparationSettings.isEmpty())
+                assertEquals(VpnConnectionState.CONNECTED, fixture.orchestrator.currentState())
+            } finally { fixture.stop(1); fixture.orchestrator.activeTransitionJob()?.join() }
+        }
+    }
+
+    @Test
+    fun authTokenRotationDoesNotDisableWakeHealthChecks(): Unit = runBlocking {
+        val fixture = Fixture(this, probeFallback = true, workingEndpoint = "tcp1", realSidecars = true)
+        fixture.setNetworkAvailability(UnderlyingNetworkAvailability.Validated)
+        fixture.startPrepared(EndpointSelectionMode.MANUAL)
+        val runtime = fixture.savedSettings().let { it.copy(
+            isAuthenticated = true, backendAccessToken = "access-before", backendRefreshToken = "refresh-before",
+            backendDeviceId = "same-device", userProfile = it.userProfile.copy(backendUserId = "same-account"),
+        ) }
+        fixture.saveSettings(runtime)
+        fixture.invoke("startConnectedWatchdog", runtime, checkNotNull(fixture.orchestrator.snapshot().owner))
+        fixture.saveSettings(runtime.copy(backendAccessToken = "access-after", backendRefreshToken = "refresh-after"))
+        fixture.orchestrator.updateSettings(runtime)
+        fixture.watchdogProbes.clear()
+        val starts = fixture.startedEndpoints.toList()
+        try {
+            fixture.invoke("handleScreenStateChanged", true)
+            fixture.awaitWakeProbe()
+            assertEquals(listOf(true), fixture.watchdogProbes)
+            assertEquals(starts, fixture.startedEndpoints)
+            assertEquals(0, fixture.runtimeRebinds)
+            assertEquals("access-after", fixture.savedSettings().backendAccessToken)
+        } finally { fixture.stop(1); fixture.orchestrator.activeTransitionJob()?.join() }
+    }
+
+    @Test
+    fun stopDuringWakeConfirmationCannotStartRecovery(): Unit = runBlocking {
+        val fixture = Fixture(this, probeFallback = true, workingEndpoint = "tcp1", realSidecars = true)
+        fixture.setNetworkAvailability(UnderlyingNetworkAvailability.Validated)
+        fixture.startPrepared(EndpointSelectionMode.MANUAL)
+        val starts = fixture.startedEndpoints.toList()
+        fixture.workingEndpoint = null
+        fixture.invoke("handleScreenStateChanged", true)
+        fixture.awaitWakeProbe()
+        fixture.onProbe = { fixture.stop(1) }
+        shadowOf(Looper.getMainLooper()).idleFor(java.time.Duration.ofSeconds(2))
+        fixture.awaitWakeProbe()
+        fixture.orchestrator.activeTransitionJob()?.join()
+        shadowOf(Looper.getMainLooper()).idleFor(java.time.Duration.ofSeconds(5))
+        yield()
+        assertEquals(starts, fixture.startedEndpoints)
+        assertTrue(fixture.preparationSettings.isEmpty())
+        assertEquals(VpnConnectionState.DISCONNECTED, fixture.orchestrator.currentState())
+        assertNull(fixture.orchestrator.currentTunnel())
     }
 
     @Test
@@ -1516,7 +1815,7 @@ class AppVpnServiceCommandTest {
     @Test
     fun requiredClientUpdateKeepsRuKillSwitchWithoutSchedulingRetry() = runBlocking {
         val fixture = Fixture(this)
-        fixture.useRuSession(ruSession()) { error("Required update must not retry the RU session") }
+        fixture.useRuSession(ruSession())
         fixture.enableKillSwitch()
         val tunnel = fixture.orchestrator.currentTunnel()
 
@@ -2026,6 +2325,7 @@ class AppVpnServiceCommandTest {
         val probeTimeouts = java.util.concurrent.CopyOnWriteArrayList<Long>()
         val readinessCandidates = java.util.concurrent.CopyOnWriteArrayList<List<String>>()
         val watchdogProbes = java.util.concurrent.CopyOnWriteArrayList<Boolean>()
+        val preparationSettings = java.util.concurrent.CopyOnWriteArrayList<StoredSettings>()
         var runtimeRunning = false
         var runtimeCarrier = ""
         var runtimeStops = 0
@@ -2034,7 +2334,11 @@ class AppVpnServiceCommandTest {
         var runtimeRebindSucceeds = true
         var rejectYoutubeStarts = false
         var tunnelsCreated = 0
+        var ruBackendCalls = 0
+        var networkRegistrationsClosed = 0
         var onProbe: () -> Unit = {}
+        var entryRouteProbe = VpnReadinessProbe(measure = { VpnProbeResult(10) }, cancel = {})
+        val entryRouteEnrollments = mutableListOf<Boolean>()
         var onConnected: (RuntimeOwner, StoredSettings) -> Unit = { _, _ -> }
         val busyProbes = java.util.concurrent.atomic.AtomicInteger()
         val probeCancels = java.util.concurrent.atomic.AtomicInteger()
@@ -2061,7 +2365,7 @@ class AppVpnServiceCommandTest {
         val orchestrator = VpnConnectionOrchestrator(
             core = object : VpnCoreRuntime {
                 override fun nokiNvCarrier(): String = runtimeCarrier
-                override fun start(config: String, tunFd: Int): Boolean {
+                override fun start(config: String, tunFd: Int, routingRules: AppVpnRoutingRules.Ready?): Boolean {
                     check(probeFallback)
                     val parsed = JSONObject(config)
                     startedConfigs += parsed
@@ -2076,6 +2380,10 @@ class AppVpnServiceCommandTest {
                 override fun rebindNetwork(): Boolean {
                     runtimeRebinds++
                     return runtimeRebindSucceeds
+                }
+                override fun prepareEntryRoute(exitNodeId: String, generation: Long, enrollment: Boolean): VpnReadinessProbe {
+                    entryRouteEnrollments += enrollment
+                    return entryRouteProbe
                 }
                 override fun cancelMeasureDelay() { probeCancels.incrementAndGet() }
                 override fun prepareReadinessCandidates(targetUrls: List<String>, timeoutMillis: Long, watchdog: Boolean): VpnReadinessProbe {
@@ -2144,7 +2452,7 @@ class AppVpnServiceCommandTest {
             set("watchdogController", VpnWatchdogController(
                 scheduler = scheduler,
                 nowMillis = { 0L },
-                launchProbe = { _, _ -> null },
+                launchProbe = ::launchWatchdogProbe,
                 isLockdown = { false },
                 evidenceFreshMillis = 1L,
             ))
@@ -2177,6 +2485,47 @@ class AppVpnServiceCommandTest {
 
         fun startAccount(strategy: VpnPreparationStrategy = VpnPreparationStrategy.FreshOnly) = invoke("startVpn", strategy)
 
+        fun enableRuStartup() {
+            val settings = SettingsRepository(service).updateSettings { current -> current.copy(
+                isAuthenticated = true, backendAccessToken = "test-access", backendDeviceId = "test-device",
+                backendDeviceKey = "dev_" + "1".repeat(64),
+                advancedSettings = current.advancedSettings.copy(ruRelayEnabled = true),
+            ) }
+            store.updateSettings { settings }
+            set("backendApi", BackendApiClient(OkHttpClient.Builder().addInterceptor {
+                ruBackendCalls++
+                throw java.io.IOException("unexpected test RU request")
+            }.build(), "https://api.example"))
+        }
+
+        fun recordNetworkRegistrations(onRegister: () -> Unit = {}): MutableList<() -> Unit> {
+            val callbacks = mutableListOf<() -> Unit>()
+            set("networkMonitor", VpnNetworkMonitor(
+                source = { AndroidUnderlyingNetworkSource(service).currentObservation() },
+                scheduler = scheduler, debounceMillis = 1L,
+                register = { callback -> callbacks += callback; onRegister(); AutoCloseable { networkRegistrationsClosed++ } },
+            ))
+            return callbacks
+        }
+
+        fun refreshNetworkMonitor() {
+            (AppVpnService::class.java.getDeclaredField("networkMonitor").apply { isAccessible = true }
+                .get(service) as VpnNetworkMonitor).refresh()
+        }
+
+        fun publishState(state: VpnConnectionState) {
+            AppVpnService::class.java.getDeclaredMethod("broadcastState", VpnConnectionState::class.java,
+                String::class.java, String::class.java, Int::class.javaObjectType)
+                .apply { isAccessible = true }.invoke(service, state, null, null, null)
+        }
+
+        fun releaseResources() {
+            AppVpnService::class.java.getDeclaredMethod("releaseVpnResources", SettingsRepository::class.java,
+                VpnConnectionState::class.java, Boolean::class.javaPrimitiveType, Boolean::class.javaPrimitiveType,
+                String::class.java).apply { isAccessible = true }
+                .invoke(service, SettingsRepository(service), VpnConnectionState.DISCONNECTED, false, true, "test_old_destroy")
+        }
+
         fun enableKillSwitch() {
             store.updateSettings { it.copy(advancedSettings = it.advancedSettings.copy(killSwitchEnabled = true)) }
             SettingsRepository(service).updateSettings {
@@ -2192,7 +2541,8 @@ class AppVpnServiceCommandTest {
             set("connectionPreparer", VpnConnectionPreparer(
                 store = store,
                 currentNetworkKind = { EndpointRankingPolicy.NetworkKind.OTHER },
-                resolveStart = { _, _, _, _ ->
+                resolveStart = { _, settings, _, _ ->
+                    preparationSettings += settings
                     onPrepare()
                     VpnStartCoordinator.StartDecision.Failure(error)
                 },
@@ -2215,7 +2565,7 @@ class AppVpnServiceCommandTest {
             ))
         }
 
-        fun useRuSession(session: BackendRuWireGuardSession.Ready, response: (okhttp3.Request) -> Pair<Int, String>) {
+        fun useRuSession(session: BackendRuWireGuardSession.Ready) {
             val settings = SettingsRepository(service).updateSettings {
                 it.copy(isAuthenticated = true, backendAccessToken = "lease-access",
                     backendDeviceId = "66666666-6666-4666-8666-666666666666", backendDeviceKey = "dev_" + "1".repeat(64),
@@ -2224,19 +2574,18 @@ class AppVpnServiceCommandTest {
             }
             store.updateSettings { settings }
             orchestrator.updateSettings(settings)
-            set("ruSession", session)
+            val credential = com.noki.vpn.data.RuEntryCredential(session.identity.relayNodeId,
+                session.wireguard, "10.240.0.1", session.identity.leaseExpiresAtEpochMillis ?: Long.MAX_VALUE)
+            val activeRoute = AppVpnService::class.java.declaredClasses.single { it.simpleName == "ActiveRuRoute" }
+                .declaredConstructors.single().apply { isAccessible = true }
+                .newInstance(credential, session.identity.exitNodeId)
+            set("ruRoute", activeRoute)
             runtimeRunning = true
             workingEndpoint = "ru"
-            val client = OkHttpClient.Builder().addInterceptor { chain ->
-                val (status, body) = response(chain.request())
-                Response.Builder().request(chain.request()).protocol(Protocol.HTTP_1_1).code(status).message("test")
-                    .body(body.toResponseBody("application/json".toMediaType())).build()
-            }.build()
-            set("backendApi", BackendApiClient(client, "https://api.example"))
         }
 
-        fun ruSession(): BackendRuWireGuardSession.Ready? = AppVpnService::class.java.getDeclaredField("ruSession")
-            .apply { isAccessible = true }.get(service) as? BackendRuWireGuardSession.Ready
+        fun ruSession(): Any? = AppVpnService::class.java.getDeclaredField("ruRoute")
+            .apply { isAccessible = true }.get(service)
 
         suspend fun checkRuStatus() = suspendCoroutineUninterceptedOrReturn<Unit> { continuation ->
             val method = AppVpnService::class.java.declaredMethods.single { it.name == "checkRuAuthorization" }
@@ -2264,12 +2613,12 @@ class AppVpnServiceCommandTest {
             store.updateSettings { it.copy(isAuthenticated = false, backendAccessToken = null, backendRefreshToken = null) }
         }
 
-        fun setNetworkAvailability(availability: UnderlyingNetworkAvailability) {
+        fun setNetworkAvailability(availability: UnderlyingNetworkAvailability, networkId: Int = 101) {
             val manager = service.getSystemService(android.content.Context.CONNECTIVITY_SERVICE) as android.net.ConnectivityManager
             val shadow = shadowOf(manager)
             shadow.clearAllNetworks()
             if (availability == UnderlyingNetworkAvailability.None) return
-            val network = org.robolectric.shadows.ShadowNetwork.newInstance(101)
+            val network = org.robolectric.shadows.ShadowNetwork.newInstance(networkId)
             val info = org.robolectric.shadows.ShadowNetworkInfo.newInstance(
                 android.net.NetworkInfo.DetailedState.CONNECTED, android.net.ConnectivityManager.TYPE_WIFI,
                 0, true, true,
@@ -2294,10 +2643,18 @@ class AppVpnServiceCommandTest {
 
         fun savedSettings(): StoredSettings = store.load()
 
+        suspend fun selectEntryRoute(exit: String, enrollment: Boolean, deadline: Long): Long? = suspendCoroutineUninterceptedOrReturn { continuation ->
+            AppVpnService::class.java.declaredMethods.single { it.name == "selectEntryRoute" }.apply { isAccessible = true }
+                .invoke(service, SettingsRepository(service), exit, enrollment, deadline, continuation)
+        }
+
         suspend fun awaitWakeProbe() {
             val inFlight = AppVpnService::class.java.getDeclaredField("wakeProbeInFlight")
                 .apply { isAccessible = true }.get(service) as java.util.concurrent.atomic.AtomicBoolean
-            kotlinx.coroutines.withTimeout(5_000L) { while (inFlight.get()) yield() }
+            val watchdog = AppVpnService::class.java.getDeclaredField("watchdogController")
+                .apply { isAccessible = true }.get(service) as VpnWatchdogController
+            val probe = VpnWatchdogController::class.java.getDeclaredField("activeProbe").apply { isAccessible = true }
+            kotlinx.coroutines.withTimeout(5_000L) { while (inFlight.get() || probe.get(watchdog) != null) yield() }
         }
 
         fun saveSettings(settings: StoredSettings) {

@@ -11,10 +11,15 @@ data class RuRelayCatalogEntry(
     val probeHost: String? = null,
     val probePort: Int? = null,
     val pairReady: Boolean = false,
+    val selectionWeight: Int = 1,
+    val metricsAt: String? = null,
+    val probeIp: String? = null,
 )
 
 /** Eligible physical overlay participants; no location or proxy listener is invented. */
-data class RuForeignNode(val id: String, val name: String, val countryCode: String, val latencyMs: Int? = null)
+data class RuForeignNode(val id: String, val name: String, val countryCode: String, val latencyMs: Int? = null,
+    val selectionWeight: Int = 1, val metricsAt: String? = null,
+    val probeHost: String? = null, val probePort: Int? = null, val probeIp: String? = null)
 
 // Inventory selection does not change the RU runtime or its route admission.
 internal fun usesRuForeignNodeCatalog(ruRelayEnabled: Boolean, foreignNodes: List<RuForeignNode>): Boolean =
@@ -55,21 +60,15 @@ object RuRelayCatalogJsonParser {
                 ?: throw IllegalArgumentException("ru_relay_catalog_entry_invalid") else false
             val unavailableReason = item.optString("unavailable_reason")
                 .takeIf { it.isNotBlank() && it != "null" }
-            val probeHost = item.optString("probe_host").trim().takeIf { value ->
-                available && pairReady && value.split('.').let { parts ->
-                    parts.size == 4 && parts.all { part ->
-                        part.isNotEmpty() && part.all(Char::isDigit) &&
-                            part.toIntOrNull()?.let { it in 0..255 } == true
-                    }
-                }
-            }
+            val probeHost = item.optBackendString("probe_host")?.trim()?.takeIf { available && pairReady && it.isNotEmpty() }
             require(name.isNotEmpty() && countryCode == "RU") { "ru_relay_catalog_entry_invalid" }
             require(available || unavailableReason != null) { "ru_relay_catalog_reason_missing" }
             val probePort = item.optInt("probe_port", 0).takeIf { probeHost != null && it in 1..65535 }
-            RuRelayCatalogEntry(id, name, countryCode, available, unavailableReason, probeHost, probePort, pairReady)
+            RuRelayCatalogEntry(id, name, countryCode, available, unavailableReason, probeHost, probePort, pairReady,
+                item.selectionWeight(), item.optBackendString("metrics_at"),
+                item.optBackendString("probe_ip")?.takeIf { available && pairReady })
         }
         require(relays.map { it.id }.toSet().size == relays.size) { "ru_relay_catalog_duplicate" }
-        require(exitNodeId != null || relays.isEmpty()) { "ru_relay_catalog_route_mismatch" }
         require(exitNodeId != null || json.optJSONArray("foreign_nodes") != null) { "ru_foreign_nodes_missing" }
         val foreignItems = json.optJSONArray("foreign_nodes")
         val foreignNodes = (0 until (foreignItems?.length() ?: 0)).map { index ->
@@ -80,7 +79,9 @@ object RuRelayCatalogJsonParser {
             require(name.isNotEmpty() && country.isNotBlank() && country != "RU") {
                 "ru_foreign_node_invalid"
             }
-            RuForeignNode(id, name, country)
+            RuForeignNode(id, name, country, selectionWeight = item.selectionWeight(), metricsAt = item.optBackendString("metrics_at"),
+                probeHost = item.optBackendString("probe_host"), probePort = item.optBackendInt("probe_port")?.takeIf { it in 1..65535 },
+                probeIp = item.optBackendString("probe_ip"))
         }
         require(foreignNodes.map { it.id }.toSet().size == foreignNodes.size) { "ru_foreign_node_duplicate" }
         return RuRelayCatalog(exitNodeId, relays, entryNodeId, expectedRouteVersion, foreignNodes)

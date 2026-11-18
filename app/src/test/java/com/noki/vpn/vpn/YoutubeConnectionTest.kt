@@ -27,6 +27,54 @@ import org.robolectric.annotation.Config
 @RunWith(RobolectricTestRunner::class)
 @Config(sdk = [28])
 class YoutubeConnectionTest {
+    @Test fun newGrantDiscoversAllowedNodesOnceAndRenewKeepsItsSelection() = runBlocking {
+        val renewals = AtomicInteger()
+        val node = "55555555-5555-4555-8555-555555555555"
+        val invalid = "66666666-6666-4666-8666-666666666666"
+        val catalog = JSONObject().put("nodes", org.json.JSONArray().put(JSONObject()
+            .put("id", node).put("name", "YT").put("country_code", "NL").put("selection_weight", 35)
+            .put("probe_ip", "203.0.113.8").put("probe_port", JSONObject.NULL)).put(JSONObject()
+            .put("id", invalid).put("name", "YT2").put("country_code", "DE")))
+        val fixture = Fixture(nodes = catalog, measure = { nodes ->
+            assertEquals(listOf(node, invalid), nodes.map { it.id })
+            assertNull(nodes.first().probePort)
+            assertEquals("203.0.113.8", nodes.first().probeIp)
+            mapOf(node to 24, invalid to 3001, "not-authorized" to 5)
+        }) { request ->
+            if (request.url.encodedPath.endsWith("/renew")) renewals.incrementAndGet()
+            youtubeAccessFixture(expiresAt = System.currentTimeMillis() + if (renewals.get() == 0) 900 else 120_000)
+        }
+        try {
+            fixture.connection.start(settings())
+            waitUntil { fixture.connection.configFor(settings()) != null }
+            waitUntil { renewals.get() > 0 }
+            val discovery = fixture.requests.filter { it.url.encodedPath == "/v1/vpn/youtube-nodes" }
+            assertEquals("Only a new grant performs selection discovery", 1, discovery.size)
+            assertEquals(settings().backendDeviceId, discovery.single().url.queryParameter("device_id"))
+            assertEquals("device-key", discovery.single().header("X-Device-Key"))
+            assertNull(discovery.single().header("X-Youtube-Transport"))
+            val create = fixture.requests.single { it.url.encodedPath == "/v1/vpn/youtube-access" }
+            val samples = JSONObject(okio.Buffer().also { create.body!!.writeTo(it) }.readUtf8()).getJSONArray("node_rtt_samples")
+            assertEquals(1, samples.length())
+            assertEquals(node, samples.getJSONObject(0).getString("node_id"))
+            assertEquals(24, samples.getJSONObject(0).getInt("rtt_ms"))
+            fixture.requests.filter { it.url.encodedPath.endsWith("/renew") }.forEach { request ->
+                assertFalse(JSONObject(okio.Buffer().also { request.body!!.writeTo(it) }.readUtf8()).has("node_rtt_samples"))
+            }
+        } finally { fixture.close() }
+    }
+
+    @Test fun oldServerWithoutDiscoveryStillCreatesTheExistingWireGuardAdmission() = runBlocking {
+        val fixture = Fixture(catalogStatus = 404) { youtubeAccessFixture() }
+        try {
+            fixture.connection.start(settings())
+            waitUntil { fixture.connection.configFor(settings()) != null }
+            assertEquals(1, fixture.requests.count { it.url.encodedPath == "/v1/vpn/youtube-nodes" })
+            val create = fixture.requests.single { it.url.encodedPath == "/v1/vpn/youtube-access" }
+            assertFalse(JSONObject(okio.Buffer().also { create.body!!.writeTo(it) }.readUtf8()).has("node_rtt_samples"))
+        } finally { fixture.close() }
+    }
+
     private fun settings(): StoredSettings = DefaultStoredSettingsFactory.create(sdkInt = 35, isFreshInstall = false).let {
         it.copy(isAuthenticated = true, backendAccessToken = "access", backendDeviceId = "11111111-1111-4111-8111-111111111111",
             backendDeviceKey = "device-key", userProfile = it.userProfile.copy(backendUserId = "account", selectedPlanTier = "plus"),
@@ -172,7 +220,7 @@ class YoutubeConnectionTest {
         val fixture = Fixture { request -> youtubeAccessFixture(if (request.method == "GET") "blocked" else "pending") }
         try {
             fixture.connection.start(settings())
-            waitUntil { fixture.requests.any { it.method == "GET" } }
+            waitUntil { fixture.requests.any { it.method == "GET" && it.url.encodedPath.startsWith("/v1/vpn/youtube-access/") } }
             assertNull(fixture.connection.configFor(settings()))
             assertEquals(0, fixture.changes.get())
             fixture.connection.stop()
@@ -236,7 +284,12 @@ class YoutubeConnectionTest {
         while (!predicate()) delay(5)
     }
 
-    private inner class Fixture(response: (Request) -> JSONObject) {
+    private inner class Fixture(
+        nodes: JSONObject = JSONObject().put("nodes", org.json.JSONArray()),
+        catalogStatus: Int = 200,
+        measure: suspend (List<VpnServer>) -> Map<String, Int> = { emptyMap() },
+        response: (Request) -> JSONObject,
+    ) {
         val scope = CoroutineScope(SupervisorJob() + Dispatchers.Unconfined)
         val requests = CopyOnWriteArrayList<Request>()
         val changes = AtomicInteger()
@@ -247,6 +300,7 @@ class YoutubeConnectionTest {
             val request = chain.request()
             requests += request
             val payload = when {
+                request.url.encodedPath == "/v1/vpn/youtube-nodes" -> nodes
                 request.url.encodedPath == "/v1/devices/challenge" -> JSONObject().put("device_id", settings().backendDeviceId)
                     .put("nonce", "nonce-${nonces.incrementAndGet()}")
                 request.url.encodedPath == "/v1/vpn/wireguard-keys" -> JSONObject()
@@ -255,11 +309,12 @@ class YoutubeConnectionTest {
                 request.method == "DELETE" -> JSONObject()
                 else -> response(request)
             }
-            Response.Builder().request(request).protocol(Protocol.HTTP_1_1).code(200).message("OK")
+            Response.Builder().request(request).protocol(Protocol.HTTP_1_1)
+                .code(if (request.url.encodedPath == "/v1/vpn/youtube-nodes") catalogStatus else 200).message("OK")
                 .body(payload.toString().toResponseBody("application/json".toMediaType())).build()
         }.build()
         val connection = YoutubeConnection(context, scope, repository,
-            { BackendApiClient(client, "https://api.example", challengeSigner = { "signature" }) }, { changes.incrementAndGet() })
+            { BackendApiClient(client, "https://api.example", challengeSigner = { "signature" }) }, { changes.incrementAndGet() }, measure)
         fun close() { connection.stop(); scope.cancel() }
     }
 }

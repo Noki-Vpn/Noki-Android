@@ -3,20 +3,26 @@ package com.noki.vpn.vpn
 import android.content.Context
 import android.net.ConnectivityManager
 import android.net.DnsResolver
+import android.net.InetAddresses
 import android.net.Network
 import android.net.NetworkCapabilities
 import android.os.Build
 import android.os.CancellationSignal
 import android.os.ParcelFileDescriptor
+import android.os.Process
 import android.system.OsConstants
 import com.noki.vpn.data.SettingsRepository
 import io.nekohasekai.libbox.*
+import kotlinx.coroutines.Dispatchers
 import java.io.File
 import java.net.Inet4Address
+import java.net.InetSocketAddress
 import java.net.NetworkInterface as JavaNetworkInterface
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.Executor
 import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicLong
+import kotlin.coroutines.EmptyCoroutineContext
 
 internal class VpnCoreController(
     private val context: Context,
@@ -26,19 +32,38 @@ internal class VpnCoreController(
     private val underlay = AndroidUnderlyingNetworkSource(context)
     private val connectivity = context.getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager
     @Volatile private var server: CommandServer? = null
+    private var ruDiagnosticLog: RuNativeDiagnosticLog? = null
     @Volatile private var tunFd = -1
+    @Volatile private var allowedUids: Set<Int>? = null
+    @Volatile private var disallowedUids: Set<Int> = emptySet()
     @Volatile private var interfaceListener: InterfaceUpdateListener? = null
     @Volatile private var defaultInterface: Pair<String, Int>? = null
 
     @Synchronized
-    override fun start(config: String, tunFd: Int): Boolean = try {
+    override fun start(config: String, tunFd: Int, routingRules: AppVpnRoutingRules.Ready?): Boolean = try {
         setup(context)
         // startOrReloadService validates and constructs the same core once.
         stop()
         this.tunFd = tunFd
-        val core = Libbox.newCommandServer(handler, platform)
+        val guardedRules = routingRules?.takeIf { it.requiresOwnerCheck }
+        val options = OverrideOptions()
+        if (guardedRules != null) {
+            check(Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) { AppVpnRoutingPolicy.OWNER_CHECK_UNAVAILABLE_REASON }
+            val packages = context.packageManager
+            allowedUids = guardedRules.allowedPackages.takeIf { it.isNotEmpty() }
+                ?.map { packages.getPackageUid(it, 0) }?.toSet()
+            disallowedUids = guardedRules.disallowedPackages.map { packages.getPackageUid(it, 0) }.toSet()
+            if (guardedRules.allowedPackages.isNotEmpty()) options.includePackage = strings(guardedRules.allowedPackages.toList())
+            if (guardedRules.disallowedPackages.isNotEmpty()) options.excludePackage = strings(guardedRules.disallowedPackages.toList())
+        }
+        val logging = SettingsRepository(context).load().advancedSettings
+        val diagnostics = if (logging.ruRelayEnabled && (logging.connectionLogsEnabled || logging.errorLogsEnabled)) {
+            RuNativeDiagnosticLog("${System.currentTimeMillis()}_${diagnosticSequence.incrementAndGet()}")
+        } else null
+        ruDiagnosticLog = diagnostics
+        val core = Libbox.newCommandServer(commandHandler(diagnostics), platform)
         server = core
-        core.startOrReloadService(config, OverrideOptions())
+        core.startOrReloadService(config, options)
         true
     } catch (error: Throwable) {
         stop()
@@ -54,13 +79,18 @@ internal class VpnCoreController(
 
     @Synchronized
     override fun stop() {
-        val core = server ?: return
+        val core = server
+        val diagnostics = ruDiagnosticLog
         server = null
-        runCatching {
+        ruDiagnosticLog = null
+        if (core != null) runCatching {
             core.cancelMeasureDelay()
             try { core.closeService() } finally { core.close() }
         }.onFailure { SafeLog.e(TAG, "Failed to stop VPN core", it) }
+        flushRuDiagnostics(diagnostics, close = true)
         tunFd = -1
+        allowedUids = null
+        disallowedUids = emptySet()
         defaultInterface = null
     }
 
@@ -90,6 +120,18 @@ internal class VpnCoreController(
             val result = measureProbe { throw error }
             VpnReadinessProbe(measure = { result }, cancel = {})
         }
+    }
+
+    @Synchronized
+    override fun prepareEntryRoute(exitNodeId: String, generation: Long, enrollment: Boolean): VpnReadinessProbe = try {
+        val diagnostics = ruDiagnosticLog
+        val selection = checkNotNull(server) { "vpn_core_not_running" }.prepareEntryRoute(exitNodeId, generation, enrollment)
+        VpnReadinessProbe(measure = {
+            try { measureProbe { selection.run() } } finally { flushRuDiagnostics(diagnostics) }
+        }, cancel = selection::cancel)
+    } catch (error: Throwable) {
+        val result = measureProbe { throw error }
+        VpnReadinessProbe(measure = { result }, cancel = {})
     }
 
     private fun measureProbe(measure: () -> Long): VpnProbeResult = try {
@@ -163,7 +205,18 @@ internal class VpnCoreController(
         override fun openTun(options: TunOptions): Int = tunFd.also { check(it >= 0) { "vpn_tun_unavailable" } }
         override fun useProcFS() = false
         override fun findConnectionOwner(protocol: Int, source: String, sourcePort: Int, destination: String,
-            destinationPort: Int): ConnectionOwner = error("native_process_rules_not_supported")
+            destinationPort: Int): ConnectionOwner {
+            check(Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q)
+            val uid = connectivity.getConnectionOwnerUid(
+                protocol,
+                InetSocketAddress(InetAddresses.parseNumericAddress(source), sourcePort),
+                InetSocketAddress(InetAddresses.parseNumericAddress(destination), destinationPort),
+            )
+            check(uid >= 0 && uid != Process.myUid() && uid !in disallowedUids && allowedUids?.contains(uid) != false) {
+                "vpn_connection_owner_unavailable"
+            }
+            return ConnectionOwner().apply { userId = uid }
+        }
         override fun startDefaultInterfaceMonitor(listener: InterfaceUpdateListener) {
             interfaceListener = listener
             updateInterface()
@@ -250,19 +303,36 @@ internal class VpnCoreController(
         }
     }
 
-    private val handler = object : CommandServerHandler {
+    private fun flushRuDiagnostics(diagnostics: RuNativeDiagnosticLog?, close: Boolean = false) {
+        val blocks = diagnostics?.drain(close).orEmpty()
+        if (blocks.isEmpty()) return
+        // Keep preference IO off the native packet callback and reconnect lifecycle lock.
+        Dispatchers.IO.dispatch(EmptyCoroutineContext) {
+            runCatching {
+                val repository = SettingsRepository(context)
+                val logging = repository.load().advancedSettings
+                if (!logging.connectionLogsEnabled && !logging.errorLogsEnabled) return@runCatching
+                for (details in blocks) repository.recordAppLog(
+                    category = "vpn_core", message = "ru_native_diagnostic", details = details,
+                )
+            }.onFailure { SafeLog.w(TAG, "Failed to store RU diagnostics", it) }
+        }
+    }
+
+    private fun commandHandler(diagnostics: RuNativeDiagnosticLog?) = object : CommandServerHandler {
         override fun serviceStop() = onStopRequested()
         override fun serviceReload() = error("vpn_reload_owned_by_service")
         override fun getSystemProxyStatus() = SystemProxyStatus()
         override fun setSystemProxyEnabled(enabled: Boolean) = error("system_proxy_not_supported")
         override fun triggerNativeCrash() = error("native_crash_not_supported")
-        override fun writeDebugMessage(message: String) = Unit
+        override fun writeDebugMessage(message: String) { diagnostics?.append(message) }
         override fun connectSSHAgent(): Int = error("native_ssh_not_supported")
     }
 
     companion object {
         private const val TAG = "NokiVpnCore"
         private var setupComplete = false
+        private val diagnosticSequence = AtomicLong()
 
         internal fun awaitDnsQuery(onCancel: (() -> Unit) -> Unit, onCancelled: () -> Unit,
                                    query: (CancellationSignal, (() -> Unit) -> Unit) -> Unit) {
@@ -311,5 +381,74 @@ internal class VpnCoreController(
                 override fun next() = iterator.next()
             }
         }
+    }
+}
+
+internal class RuNativeDiagnosticLog(private val attemptId: String) {
+    private val lock = Any()
+    private val events = ArrayList<String>()
+    private var closed = false
+    private var discarded = 0
+
+    fun append(message: String) {
+        val event = sanitize(message) ?: return
+        synchronized(lock) {
+            if (closed) return
+            if (events.size < 144) events += event else discarded++
+        }
+    }
+
+    fun drain(close: Boolean = false): List<String> = synchronized(lock) {
+        if (close) closed = true
+        if (events.isEmpty()) return@synchronized emptyList()
+        val header = "revision=ru_rx_v1_20261115; attempt=$attemptId"
+        val lines = events.toList() + if (discarded > 0) listOf("discarded=$discarded") else emptyList()
+        events.clear()
+        discarded = 0
+        val blocks = ArrayList<String>()
+        var block = header
+        for (line in lines) {
+            if (block.length + 1 + line.length > 1800) {
+                blocks += block
+                block = header
+            }
+            block += "\n$line"
+        }
+        blocks += block
+        blocks
+    }
+
+    private fun sanitize(message: String): String? {
+        if (!message.startsWith(PREFIX) || message.length > 1024) return null
+        val fields = LinkedHashMap<String, String>()
+        for (token in message.removePrefix(PREFIX).split(' ')) {
+            val match = TOKEN.matchEntire(token) ?: return null
+            val (key, value) = match.destructured
+            if (key !in FIELD_ORDER || fields.put(key, value) != null) return null
+            val safe = when (key) {
+                "event" -> value in EVENTS
+                "reason" -> value in REASONS
+                "sender", "receiver" -> INDEX.matches(value)
+                "ip" -> value == "4" || value == "6"
+                "ok", "checksum_ok" -> value == "0" || value == "1"
+                else -> NUMBER.matches(value) && value.toULongOrNull() != null
+            }
+            if (!safe) return null
+        }
+        if (!fields.keys.containsAll(listOf("event", "seq", "ms", "utc_ms"))) return null
+        return FIELD_ORDER.mapNotNull { key -> fields[key]?.let { "$key=$it" } }.joinToString(" ")
+    }
+
+    private companion object {
+        const val PREFIX = "noki_ru_diag_v1 "
+        val TOKEN = Regex("([a-z_]+)=([a-z0-9_]+)")
+        val NUMBER = Regex("[0-9]{1,20}")
+        val INDEX = Regex("[0-9a-f]{12}")
+        val FIELD_ORDER = listOf("event", "seq", "ms", "utc_ms", "gen", "len", "type", "sender", "receiver",
+            "counter", "ip", "proto", "flags", "tcp_seq", "tcp_ack", "ok", "checksum_ok", "errno", "reason", "rx_bytes", "tx_bytes", "handshake")
+        val EVENTS = setOf("start", "bind_open", "socket_open", "udp_rx", "udp_tx", "connect_error", "read_error",
+            "write_error", "bind_close", "inner_rx", "inner_tx", "stack_rx", "stack_deliver", "tcp_dial_done", "wg_state", "peer_stats", "close")
+        val REASONS = setOf("handshake_response", "handshake_initiation", "keepalive", "invalid_mac", "invalid_response",
+            "invalid_initiation", "disallowed_source", "invalid_ip", "unknown_type", "keypair_error", "tun_write_error", "receive_error")
     }
 }

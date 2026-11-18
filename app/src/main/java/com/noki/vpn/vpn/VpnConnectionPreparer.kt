@@ -70,7 +70,8 @@ internal class VpnConnectionPreparer(
         }
         val prepareAutoCandidates = localSettings.advancedSettings.effectiveProtocol == VpnProtocol.AUTO &&
             localSettings.endpointOptions.any { it.proxyType == "nokinv" }
-        if (!strategy.forceRefreshSession && !prepareAutoCandidates &&
+        val automaticNode = localSettings.userProfile.serverSelectionMode != com.noki.vpn.data.ServerSelectionMode.SERVER
+        if (!strategy.forceRefreshSession && !prepareAutoCandidates && !automaticNode &&
             RuntimeProfilePolicy.isCachedProfileUsable(localSettings)) {
             return Outcome.Success(
                 PreparedVpnSession(

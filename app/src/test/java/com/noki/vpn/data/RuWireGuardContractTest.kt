@@ -16,7 +16,107 @@ import okhttp3.ResponseBody.Companion.toResponseBody
 import okio.Buffer
 import com.noki.vpn.vpn.awaitRuWireGuardReady
 
+@org.junit.runner.RunWith(org.robolectric.RobolectricTestRunner::class)
+@org.robolectric.annotation.Config(sdk = [28])
 class RuWireGuardContractTest {
+    @Test fun persistedEntryNeverBypassesFreshAutoEligibilityOnANewStart() = runBlocking {
+        withCachedEntry { context, repository, settings, _, _ ->
+            val client = OkHttpClient.Builder().addInterceptor { chain ->
+                Response.Builder().request(chain.request()).protocol(Protocol.HTTP_1_1).code(200).message("OK")
+                    .body("""{"route_version":1,"entry_node_id":null,"exit_node_id":null,"relays":[],"foreign_nodes":[]}"""
+                        .toResponseBody("application/json".toMediaType())).build()
+            }.build()
+            val result = runCatching { com.noki.vpn.vpn.RuWireGuardConnectionCoordinator(context, repository,
+                BackendApiClient(client, "https://api.example")).prepare(settings) }
+            result.getOrNull()?.privateKey?.fill(0)
+            assertTrue("A valid lease must not skip fresh allowed-node selection", result.isFailure)
+        }
+    }
+
+    @Test fun freshAutoCanReplaceAPersistedIngressAndOnly503TriesTheRemainingPair() = runBlocking {
+        for (entryStatus in listOf(200, 503, 403, 429)) withCachedEntry { context, repository, settings, exit, entry ->
+            val fresh = "44444444-4444-4444-8444-444444444444"
+            val requests = mutableListOf<okhttp3.Request>()
+            val attempts = mutableListOf<String>()
+            val publicKey = WireGuardKeyStore.android(context).getOrCreate().let { pair ->
+                pair.publicKeyBase64().also { pair.privateKey.fill(0) }
+            }
+            val cached = checkNotNull(repository.readRuEntry("account", settings.backendDeviceId, publicKey))
+            val client = OkHttpClient.Builder().addInterceptor { chain ->
+                val request = chain.request()
+                requests += request
+                val payload = when (request.url.encodedPath) {
+                    "/v1/vpn/ru-relays" -> JSONObject().put("route_version", 1).put("entry_node_id", JSONObject.NULL)
+                        .put("exit_node_id", request.url.queryParameter("exit_node_id") ?: JSONObject.NULL)
+                        .put("foreign_nodes", org.json.JSONArray().put(JSONObject().put("id", exit).put("name", "NL").put("country_code", "NL")))
+                        .put("relays", org.json.JSONArray().put(JSONObject().put("id", fresh).put("name", "Fresh").put("country_code", "RU")
+                            .put("available", true).put("pair_ready", true).put("probe_host", "fresh.example").put("probe_port", 25001))
+                            .put(JSONObject().put("id", entry).put("name", "Cached").put("country_code", "RU").put("available", true)
+                                .put("pair_ready", true).put("probe_host", "old.example").put("probe_port", 25002)))
+                    "/v1/devices/challenge" -> JSONObject().put("device_id", settings.backendDeviceId).put("nonce", "nonce-1234567890123456")
+                    "/v1/vpn/wireguard-keys" -> JSONObject().put("id", "55555555-5555-4555-8555-555555555555").put("public_key", publicKey)
+                    "/v1/vpn/ru-entry" -> {
+                        attempts += JSONObject(Buffer().also { request.body!!.writeTo(it) }.readUtf8()).getString("relay_node_id")
+                        JSONObject(cached.toString()).put("relay_node_id", fresh)
+                    }
+                    else -> error("unexpected route")
+                }
+                Response.Builder().request(request).protocol(Protocol.HTTP_1_1)
+                    .code(if (request.url.encodedPath == "/v1/vpn/ru-entry") entryStatus else 200).message("OK")
+                    .body(payload.toString().toResponseBody("application/json".toMediaType())).build()
+            }.build()
+            val measuredHosts = java.util.concurrent.CopyOnWriteArrayList<String>()
+            val sampler = ClientLatencySampler(tcpConnect = { host, _, _ -> measuredHosts += host; if (host == "fresh.example") 20 else 150 }, tcpAttempts = 1)
+            val result = runCatching { com.noki.vpn.vpn.RuWireGuardConnectionCoordinator(context, repository,
+                BackendApiClient(client, "https://api.example", challengeSigner = { "signature" }), sampler, { "signature" }, { 0.0 }).prepare(settings) }
+            assertEquals(listOf(fresh), attempts)
+            assertEquals(setOf("fresh.example", "old.example"), measuredHosts.toSet())
+            assertEquals(2, requests.count { it.url.encodedPath == "/v1/vpn/ru-relays" })
+            if (entryStatus in listOf(200, 503)) {
+                val prepared = result.getOrThrow()
+                assertEquals(if (entryStatus == 200) fresh else entry, prepared.credential.relayNodeId)
+                assertEquals(exit, prepared.exitNode.id)
+                assertEquals(entryStatus == 200, prepared.enrolled)
+                prepared.privateKey.fill(0)
+            } else assertEquals(entryStatus, (result.exceptionOrNull() as BackendException).statusCode)
+        }
+    }
+
+    private suspend fun withCachedEntry(action: suspend (android.content.Context, SettingsRepository, StoredSettings, String, String) -> Unit) {
+        val context = org.robolectric.RuntimeEnvironment.getApplication()
+        val provider = object : java.security.Provider("RuSelectionTest", 1.0, "Test-only Android keystore") {
+            init { put("KeyStore.AndroidKeyStore", com.noki.vpn.vpn.AppVpnServiceCommandTest.InMemoryAndroidKeyStore::class.java.name) }
+        }
+        java.security.Security.addProvider(provider)
+        try {
+            val pair = WireGuardKeyStore(
+                java.io.File(context.noBackupFilesDir, "ru-wireguard-device-key-v1.bin"),
+                { javax.crypto.spec.SecretKeySpec(ByteArray(32) { 1 }, "AES") }, {},
+                { WireGuardKeyPair(ByteArray(32) { 8 }.apply { this[31] = 72 }, ByteArray(32) { 7 }) },
+            ).getOrCreate()
+            val device = "11111111-1111-4111-8111-111111111111"
+            val exit = "22222222-2222-4222-8222-222222222222"
+            val entry = "33333333-3333-4333-8333-333333333333"
+            val settings = DefaultStoredSettingsFactory.create().let { base -> base.copy(
+                isAuthenticated = true, backendAccessToken = "access", backendDeviceId = device, backendDeviceKey = "dev_" + "a".repeat(64),
+                userProfile = base.userProfile.copy(backendUserId = "account", serverSelectionMode = ServerSelectionMode.AUTO),
+                advancedSettings = base.advancedSettings.copy(ruRelayEnabled = true)) }
+            val repository = SettingsRepository(context)
+            repository.updateSettings { settings }
+            repository.saveRuEntry("account", device, pair.publicKeyBase64(), RuEntryCredential(entry,
+                BackendRuWireGuardConfig("203.0.113.5:51820", java.util.Base64.getEncoder().encodeToString(ByteArray(32) { 9 }),
+                    "10.240.1.2/32", listOf("10.240.1.1"), 1280, listOf("0.0.0.0/0")), "10.240.1.1", System.currentTimeMillis() + 120_000),
+                listOf(RuForeignNode(exit, "Exit", "NL")))
+            val reloadedPair = WireGuardKeyStore.android(context).getOrCreate()
+            assertEquals(pair.publicKeyBase64(), reloadedPair.publicKeyBase64())
+            val cached = checkNotNull(repository.readRuEntry("account", device, reloadedPair.publicKeyBase64()))
+            assertEquals(entry, RuWireGuardSessionJsonParser.parseEntryCredential(cached).relayNodeId)
+            reloadedPair.privateKey.fill(0)
+            pair.privateKey.fill(0)
+            action(context, repository, settings, exit, entry)
+        } finally { java.security.Security.removeProvider("RuSelectionTest") }
+    }
+
     private fun youtubeCascade(): JSONObject = JSONObject()
         .put("host", "cascade.example.test").put("port", 443)
         .put("uuid", "11111111-1111-4111-8111-111111111111").put("server_name", "cdn.example.test")

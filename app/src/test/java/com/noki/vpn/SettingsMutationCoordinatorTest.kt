@@ -91,7 +91,7 @@ class SettingsMutationCoordinatorTest {
     }
 
     @Test
-    fun ruEntryAwayAndBackInvalidatesTheEarlierCandidateWithTheSameFinalTuple() {
+    fun ruModeAwayAndBackInvalidatesTheEarlierCandidateWithTheSameFinalSelection() {
         val chain = MultiHopSettings(true,
             HopSelection(com.noki.vpn.data.ServerSelectionMode.SERVER,
                 nodeId = "11111111-1111-4111-8111-111111111111"),
@@ -99,17 +99,15 @@ class SettingsMutationCoordinatorTest {
                 nodeId = "22222222-2222-4222-8222-222222222222"))
         val defaults = authenticatedSettings()
         val baseline = defaults.copy(advancedSettings = defaults.advancedSettings.copy(
-            ruRelayEnabled = true, multiHop = chain))
+            ruRelayEnabled = true, multiHop = chain.copy(enabled = false)))
         val coordinator = SettingsMutationCoordinator(InMemoryAtomicStoredSettingsStore(baseline))
         val changed = coordinator.persistUiFields(stateFrom(baseline).copy(
-            advancedSettings = baseline.advancedSettings.copy(multiHop = chain.copy(entry =
-                HopSelection(com.noki.vpn.data.ServerSelectionMode.SERVER,
-                    nodeId = "33333333-3333-4333-8333-333333333333"))),
+            advancedSettings = baseline.advancedSettings.copy(ruRelayEnabled = false),
         ))
         val restored = coordinator.persistUiFields(stateFrom(changed).copy(
-            advancedSettings = baseline.advancedSettings,
+            advancedSettings = baseline.advancedSettings.copy(multiHop = chain),
         ))
-        assertEquals(chain, restored.advancedSettings.multiHop)
+        assertEquals(chain.copy(enabled = false), restored.advancedSettings.multiHop)
         assertEquals(baseline.ruRelaySelectionRevision + 2, restored.ruRelaySelectionRevision)
         assertEquals(true, VpnSettingsTransactionPolicy.candidateBecameStale(baseline, restored))
     }
