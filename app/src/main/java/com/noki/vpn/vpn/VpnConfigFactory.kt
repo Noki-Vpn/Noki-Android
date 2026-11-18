@@ -55,15 +55,18 @@ object VpnConfigFactory {
     private fun blockUntilEntryRoute(config: JSONObject, gateway: String? = null) {
         val route = config.getJSONObject("route")
         val rules = route.getJSONArray("rules")
+        val sniffIndex = (0 until rules.length()).first { rules.getJSONObject(it).optString("action") == "sniff" }
         val protected = JSONArray()
-            .put(JSONObject().put("type", "logical").put("mode", "and").put("invert", true)
-                .put("rules", JSONArray().put(JSONObject().put("clash_mode", "NokiRouteReady"))).put("action", "reject"))
+        // Keep unconditional family rejection ahead of readiness and sniffing.
+        for (index in 0 until sniffIndex) protected.put(rules.getJSONObject(index))
+        protected.put(JSONObject().put("type", "logical").put("mode", "and").put("invert", true)
+            .put("rules", JSONArray().put(JSONObject().put("clash_mode", "NokiRouteReady"))).put("action", "reject"))
         gateway?.let { protected.put(JSONObject().put("ip_cidr", JSONArray().put("$it/32"))
             .put("port", ENTRY_ROUTE_PORT).put("action", "reject")) }
-        protected.put(rules.getJSONObject(0)) // Sniff HTTP Host and TLS SNI before testing the reserved name.
+        protected.put(rules.getJSONObject(sniffIndex)) // Sniff HTTP Host and TLS SNI before testing the reserved name.
         protected.put(JSONObject().put("domain", JSONArray().put(ENTRY_ROUTE_HOST).put("$ENTRY_ROUTE_HOST."))
             .put("action", "reject"))
-        for (index in 1 until rules.length()) protected.put(rules.getJSONObject(index))
+        for (index in sniffIndex + 1 until rules.length()) protected.put(rules.getJSONObject(index))
         route.put("rules", protected)
     }
 
@@ -100,7 +103,8 @@ object VpnConfigFactory {
             domainMatch(listOf(DomainRulePolicy.RUSSIAN_RESOURCES_RULE), resolved)
                 ?: throw IllegalArgumentException("geosite_category_ru_empty")
         } else null
-        val rules = JSONArray()
+        // Reject at SYN pre-match, before sniff or any direct/domain route. Never degrade to silent drop.
+        val rules = JSONArray().put(JSONObject().put("ip_version", 6).put("action", "reject").put("no_drop", true))
         rules.put(JSONObject().put("inbound", JSONArray().put("tun"))
             .put("action", "sniff").put("sniffer", JSONArray().put("http").put("tls")
                 .apply { if (normalized.youtubeNoAdsEnabled) put("quic") }))
@@ -120,8 +124,6 @@ object VpnConfigFactory {
         if (normalized.youtubeNoAdsEnabled) {
             val youtube = domainMatch(listOf(YOUTUBE_RULE), resolved)
                 ?: throw IllegalArgumentException("geosite_youtube_empty")
-            rules.put(JSONObject().put("type", "logical").put("mode", "and").put("rules", JSONArray()
-                .put(JSONObject(youtube.toString())).put(JSONObject().put("ip_version", 6))).put("action", "reject"))
             val udp = networkDomainMatch(youtube, "udp")
             rules.put(if (youtubeConnection == null) udp.put("action", "reject") else route(udp, YOUTUBE_TAG))
             val tcp = networkDomainMatch(youtube, "tcp")
@@ -136,7 +138,6 @@ object VpnConfigFactory {
             rules.put(route(JSONObject(match.toString()), "direct"))
             dnsRules.put(JSONObject(match.toString()).put("server", BOOTSTRAP_TAG))
         }
-        rules.put(JSONObject().put("ip_version", 6).put("action", "reject"))
         domainMatch(normalized.alwaysOnDomains, resolved)?.let { rules.put(route(it, "proxy")) }
         // The wire list supplies an explicit primary. Native DNS has no synthesized failover.
         val dns = JSONArray().put(JSONObject().put("type", "tcp").put("tag", DNS_TAG)

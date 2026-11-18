@@ -53,8 +53,8 @@ val geoipLicenseFile = layout.projectDirectory.file("src/main/assets/licenses/ge
 val prismalAarFile = layout.projectDirectory.file("libs/prismal-1.0.3.aar")
 val prismalAarSha256 = "40D5EAFC3B68554E0D5E159EA02ECDA8CA86EB32A43DC1B3BAE5C65344C08C2A"
 val supportedAbis = listOf("arm64-v8a", "armeabi-v7a", "x86_64")
-val expectedReleaseVersionCode = 330
-val expectedReleaseVersionName = "2.3.14"
+val expectedReleaseVersionCode = 331
+val expectedReleaseVersionName = "2.3.15"
 
 fun String.toBuildConfigString(): String =
     "\"${replace("\\", "\\\\").replace("\"", "\\\"")}\""

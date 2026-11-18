@@ -31,7 +31,7 @@ internal class AndroidTunInterfaceFactory(
             .addAddress("10.10.0.2", 32)
             .addDnsServer(VpnTunnelPolicy.DNS_SERVER)
             .addRoute("0.0.0.0", 0)
-            .addRoute("::", 0)
+        // IPv4-only TUN: Android blocks the unconfigured IPv6 family without underlay bypass.
         return establishWithRules(builder, settings, underlay)
     }
 

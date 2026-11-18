@@ -27,6 +27,34 @@ import org.robolectric.util.ReflectionHelpers
     shadows = [VpnTunnelPolicyTest.TunnelAllocationShadow::class])
 class VpnTunnelPolicyTest {
     @Test
+    @Config(sdk = [35])
+    fun bothTunBuildersKeepIpv6BlockedWithoutBypassWhileAdvertisingIpv4() {
+        val service = Robolectric.buildService(VpnService::class.java).create().get()
+        val settings = DefaultStoredSettingsFactory.create().copy(
+            filterMode = AppFilterMode.ALL_APPS, selectedPackages = emptySet())
+        val wg = BackendRuWireGuardConfig("203.0.113.10:51820",
+            java.util.Base64.getEncoder().encodeToString(ByteArray(32) { 2 }),
+            "10.240.1.2/32", listOf("1.1.1.1"), 1280, listOf("0.0.0.0/0"))
+        val underlay = UnderlyingNetworkSnapshot(com.noki.vpn.data.EndpointRankingPolicy.NetworkKind.WIFI,
+            "test-network", false, "test-network", org.robolectric.shadows.ShadowNetwork.newInstance(71))
+        for (snapshot in listOf(null, underlay)) for (ru in listOf(false, true)) {
+            val factory = AndroidTunInterfaceFactory(service)
+            if (ru) factory.establishWireGuard(settings, snapshot, wg) else factory.establish(settings, snapshot)
+            val config = requireNotNull(TunnelAllocationShadow.capturedConfig)
+            val addresses = TunnelAllocationShadow.advertisedAddresses
+            val routes = TunnelAllocationShadow.advertisedRoutes
+            val dns = ReflectionHelpers.getField<List<String>>(config, "dnsServers")
+            assertTrue(addresses.all { it.address is java.net.Inet4Address })
+            assertEquals(listOf(if (ru) "10.240.1.2/32" else "10.10.0.2/32"), addresses.map { it.toString() })
+            assertEquals(listOf("0.0.0.0/0"), routes.map { it.destination.toString() })
+            assertEquals(listOf("198.18.0.1"), dns)
+            assertFalse(ReflectionHelpers.getField<Boolean>(config, "allowIPv6"))
+            assertFalse(ReflectionHelpers.getField<Boolean>(config, "allowBypass"))
+            assertEquals(if (ru) 1280 else 1500, ReflectionHelpers.getField<Int>(config, "mtu"))
+        }
+    }
+
+    @Test
     fun vpnAdvertisesReservedDnsInsteadOfPublicProvider() {
         val address = InetAddress.getByName(VpnTunnelPolicy.DNS_SERVER).address
 
@@ -121,12 +149,18 @@ class VpnTunnelPolicyTest {
         @Implementation
         fun establish(): ParcelFileDescriptor? {
             val config = ReflectionHelpers.getField<Any>(builder, "mConfig")
+            capturedConfig = config
+            advertisedAddresses = ReflectionHelpers.getField<List<android.net.LinkAddress>>(builder, "mAddresses").toList()
+            advertisedRoutes = ReflectionHelpers.getField<List<android.net.RouteInfo>>(builder, "mRoutes").toList()
             advertisedDns = ReflectionHelpers.getField<List<String>?>(config, "dnsServers").orEmpty().toList()
             return null
         }
 
         companion object {
             var advertisedDns: List<String> = emptyList()
+            var capturedConfig: Any? = null
+            var advertisedAddresses: List<android.net.LinkAddress> = emptyList()
+            var advertisedRoutes: List<android.net.RouteInfo> = emptyList()
         }
     }
 }

@@ -17,6 +17,45 @@ import org.junit.Assert.assertTrue
 import org.junit.Test
 
 class VpnConfigFactoryTest {
+    @Test fun ipv6RejectPrecedesSniffAndEveryRoutingExceptionOnAllTunPaths() {
+        val wg = BackendRuWireGuardConfig("203.0.113.10:51820",
+            java.util.Base64.getEncoder().encodeToString(ByteArray(32) { 2 }),
+            "10.240.7.2/32", listOf("10.240.7.1"), 1280, listOf("0.0.0.0/0"))
+        val data = geosite.copy(russianCidrs = geosite.russianCidrs + "2001:db8::/32")
+        val nat = BackendVpnSessionJsonParser.parse(contractFixture("multihop_session_v2.json"))
+        for (youtube in listOf(false, true)) {
+            val settings = AdvancedSettings(youtubeNoAdsEnabled = youtube,
+                bypassDomains = listOf(DomainRulePolicy.RUSSIAN_RESOURCES_RULE, "domain:custom.example"))
+            val secondary = if (youtube) youtubeRemote() else null
+            val configs = (primaryProfiles() + profile().copy(entryRoute = true)).map {
+                JSONObject(VpnConfigFactory.build(it, settings, data, secondary))
+            } + nat.endpointCandidates.map { candidate ->
+                JSONObject(VpnConfigFactory.build(EndpointSelector.profileFromCandidate(nat, candidate),
+                    settings.copy(multiHop = requireNotNull(nat.multiHop).selection), data, secondary))
+            } + listOf(null, "10.240.7.1").map { gateway ->
+                JSONObject(VpnConfigFactory.buildWireGuard(wg, ByteArray(32) { 1 },
+                    settings.copy(ruRelayEnabled = true), data, secondary, gateway))
+            }
+            for (config in configs) {
+                val route = rules(config)
+                assertEquals(6, route.first().optInt("ip_version"))
+                assertEquals("reject", route.first().getString("action"))
+                assertTrue(route.first().getBoolean("no_drop"))
+                assertFalse(route.first().has("inbound"))
+                assertFalse(route.first().has("network"))
+                assertEquals(1, Regex("\\\"ip_version\\\"\\s*:\\s*6").findAll(config.toString()).count())
+                val sniff = route.indexOfFirst { it.optString("action") == "sniff" }
+                assertTrue(sniff > 0)
+                val reserved = route.indexOfFirst { it.optJSONArray("domain")?.toString()?.contains("entry-route.invalid") == true }
+                if (reserved >= 0) assertTrue(sniff < reserved)
+                assertTrue(route.any { it.optString("outbound") == "direct" && it.toString().contains("custom.example") })
+                assertEquals("proxy", config.getJSONObject("route").getString("final"))
+                assertEquals("ipv4_only", config.getJSONObject("dns").getString("strategy"))
+                assertTrue(config.getJSONArray("inbounds").getJSONObject(0).getJSONArray("address").getString(0).endsWith("/32"))
+            }
+        }
+    }
+
     @Test fun naiveUsesNativeCronetAndAuthenticatedUotWithoutVlessOptions() {
         val profile = VlessProfile(proxyType = "naive", transport = "naive", security = "tls",
             host = "node.example", port = "443", serverName = "node.example",
@@ -82,7 +121,7 @@ class VpnConfigFactoryTest {
         assertFalse(outbound.has("uuid"))
         assertFalse(outbound.has("ip_tunnel"))
         val youtubeConfig = JSONObject(VpnConfigFactory.build(profile, settings.copy(youtubeNoAdsEnabled = true), geosite))
-        val sniff = youtubeConfig.getJSONObject("route").getJSONArray("rules").getJSONObject(0)
+        val sniff = rules(youtubeConfig).single { it.optString("action") == "sniff" }
         assertEquals("sniff", sniff.getString("action"))
         assertEquals("[\"tun\"]", sniff.getJSONArray("inbound").toString())
         assertFalse(sniff.has("rules"))
@@ -480,17 +519,18 @@ class VpnConfigFactoryTest {
             "10.240.7.2/32", listOf("10.240.7.1"), 1280, listOf("0.0.0.0/0"))
         val route = rules(JSONObject(VpnConfigFactory.buildWireGuard(wg, ByteArray(32) { 1 },
             AdvancedSettings(ruRelayEnabled = true), geosite, entryRouteGateway = "10.240.7.1")))
-        assertTrue(route[0].getBoolean("invert"))
-        assertEquals("NokiRouteReady", route[0].getJSONArray("rules").getJSONObject(0).getString("clash_mode"))
-        assertEquals("reject", route[1].getString("action"))
-        assertEquals("10.240.7.1/32", route[1].getJSONArray("ip_cidr").getString(0))
-        assertEquals(62101, route[1].getInt("port"))
-        assertEquals("sniff", route[2].getString("action"))
-        assertEquals("reject", route[3].getString("action"))
-        val names = route[3].getJSONArray("domain")
+        assertEquals(6, route[0].getInt("ip_version"))
+        assertTrue(route[1].getBoolean("invert"))
+        assertEquals("NokiRouteReady", route[1].getJSONArray("rules").getJSONObject(0).getString("clash_mode"))
+        assertEquals("reject", route[2].getString("action"))
+        assertEquals("10.240.7.1/32", route[2].getJSONArray("ip_cidr").getString(0))
+        assertEquals(62101, route[2].getInt("port"))
+        assertEquals("sniff", route[3].getString("action"))
+        assertEquals("reject", route[4].getString("action"))
+        val names = route[4].getJSONArray("domain")
         assertEquals(listOf("entry-route.invalid", "entry-route.invalid."),
             (0 until names.length()).map(names::getString))
-        assertEquals("hijack-dns", route[4].getString("action"))
+        assertEquals("hijack-dns", route[5].getString("action"))
     }
 
     @Test
@@ -639,8 +679,8 @@ class VpnConfigFactoryTest {
         assertFalse(disabled.toString().contains("203.0.113.5"))
         val missing = JSONObject(VpnConfigFactory.build(profile(), AdvancedSettings(youtubeNoAdsEnabled = true), geosite))
         val youtubeRules = rules(missing).filter { it.toString().contains("googlevideo.com") }
-        assertEquals(3, youtubeRules.size)
-        assertEquals(3, youtubeRules.count { it.getString("action") == "reject" && !it.has("outbound") })
+        assertEquals(2, youtubeRules.size)
+        assertEquals(2, youtubeRules.count { it.getString("action") == "reject" && !it.has("outbound") })
         assertFalse(youtubeRules.any { it.getString("action") == "resolve" })
         assertEquals("proxy", missing.getJSONObject("route").getString("final"))
     }
@@ -650,12 +690,13 @@ class VpnConfigFactoryTest {
         assertEquals("proxy", config.getJSONObject("route").getString("final"))
         assertFalse(config.getJSONArray("inbounds").getJSONObject(0).getJSONArray("address").toString().contains("10.241"))
         val rejects = rules(config).filter { it.toString().contains("googlevideo.com") && it.optString("action") == "reject" }
-        assertTrue(rejects.any { it.getJSONArray("rules").getJSONObject(1).optInt("ip_version") == 6 })
+        assertTrue(rejects.isEmpty())
+        assertEquals(6, rules(config).first().getInt("ip_version"))
+        assertEquals("reject", rules(config).first().getString("action"))
         val youtubeRoutes = rules(config).filter { it.optString("outbound") == "youtube-ru" }
         assertEquals(setOf("tcp", "udp"), youtubeRoutes.map {
             it.getJSONArray("rules").getJSONObject(1).getJSONArray("network").getString(0)
         }.toSet())
-        assertFalse(rejects.any { it.getJSONArray("rules").getJSONObject(1).has("network") })
         assertFalse(rules(config).any { it.optString("action") == "resolve" })
         val dnsRules = config.getJSONObject("dns").getJSONArray("rules")
         val dns = (0 until dnsRules.length()).map(dnsRules::getJSONObject).first { it.toString().contains("googlevideo.com") }
