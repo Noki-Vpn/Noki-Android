@@ -147,6 +147,22 @@ class AdaptiveScreenLayoutTest {
         }
     }
 
+    @Test
+    @Config(qualifiers = "w320dp-h640dp-420dpi")
+    fun mandatoryUpdateTitleDoesNotTruncateOnANarrowScreen() {
+        val title = "Необходимо обновить приложение"
+        val state = com.noki.vpn.AndroidUpdateUiState(isRequired = true, currentVersionName = "2.3.16")
+        render { MandatoryAndroidUpdateDialog(state, AppLanguage.RU, onUpdate = {}) }.use {
+            val layouts = mutableListOf<androidx.compose.ui.text.TextLayoutResult>()
+            compose.onNodeWithText(title, useUnmergedTree = true).assertIsDisplayed().performSemanticsAction(
+                androidx.compose.ui.semantics.SemanticsActions.GetTextLayoutResult,
+            ) { it(layouts) }
+            val layout = layouts.single()
+            assertFalse(layout.hasVisualOverflow)
+            assertEquals(title.length, layout.getLineEnd(layout.lineCount - 1, visibleEnd = true))
+        }
+    }
+
     @Before
     fun provideInMemoryAndroidKeyStore() {
         android.provider.Settings.Secure.putString(
@@ -696,6 +712,31 @@ class AdaptiveScreenLayoutTest {
         val viewModel = layoutViewModel()
         checkSettingsWidth("Расширенные настройки", "advanced-wide") {
             AdvancedSettingsScreen(russianState(), viewModel, rememberPrismalGlassLayer(), liveGlassEnabled = false, showBackground = false)
+        }
+    }
+
+    @Test
+    @Config(qualifiers = "w412dp-h915dp-420dpi")
+    fun bypassRuleCounterIncludesTheEnabledBuiltInRule() {
+        val viewModel = layoutViewModel()
+        val defaults = com.noki.vpn.data.DefaultStoredSettingsFactory.create().advancedSettings
+        val state = russianState()
+        var rules by androidx.compose.runtime.mutableStateOf(defaults)
+        render {
+            AdvancedSettingsScreen(state.copy(advancedSettings = rules), viewModel, rememberPrismalGlassLayer(),
+                liveGlassEnabled = false, showBackground = false)
+        }.use {
+            compose.onNodeWithText("домен всегда без ВПН").performScrollTo().assertIsDisplayed()
+            compose.onNodeWithText("1").assertIsDisplayed()
+            saveImage("advanced-rule-count-phone")
+
+            compose.runOnIdle { rules = defaults.copy(bypassDomains = defaults.bypassDomains + "domain:example.com") }
+            compose.onNodeWithText("домена всегда без ВПН").assertIsDisplayed()
+            compose.onNodeWithText("2").assertIsDisplayed()
+
+            compose.runOnIdle { rules = defaults.copy(bypassDomains = emptyList()) }
+            compose.onNodeWithText("доменов всегда без ВПН").assertIsDisplayed()
+            compose.onAllNodesWithText("0").assertCountEquals(2)
         }
     }
 

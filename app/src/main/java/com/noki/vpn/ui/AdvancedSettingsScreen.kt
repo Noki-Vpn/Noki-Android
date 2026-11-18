@@ -36,7 +36,6 @@ import com.styropyr0.prismal.sources.prismalGlassLayer
 import com.noki.vpn.AppUiState
 import com.noki.vpn.MainViewModel
 import com.noki.vpn.manualEndpointOptionsForCurrentCountry
-import com.noki.vpn.data.DomainRulePolicy
 import com.noki.vpn.data.EndpointSelectionMode
 import kotlinx.coroutines.delay
 
@@ -77,7 +76,7 @@ fun AdvancedSettingsScreen(
             val language = state.personalizationSettings.language
             val autoEndpointSelection = state.advancedSettings.endpointSelectionMode == EndpointSelectionMode.AUTO
             val alwaysOnCount = state.advancedSettings.alwaysOnDomains.size
-            val bypassCount = state.advancedSettings.bypassDomains.count { it != DomainRulePolicy.RUSSIAN_RESOURCES_RULE }
+            val bypassCount = state.advancedSettings.bypassDomains.size
             var showProtocolSheet by rememberSaveable { mutableStateOf(false) }
             var showProtocolNotice by rememberSaveable { mutableStateOf(false) }
             LaunchedEffect(state.advancedSettings.ruRelayEnabled, state.advancedSettings.gamingModeEnabled) {
@@ -256,9 +255,7 @@ fun AdvancedSettingsScreen(
                 AdvancedDomainRuleWideCard(
                     title = tr(language, "Всегда выключать", "Always off"),
                     count = bypassCount,
-                    summary = bypassRuleSummary(language, bypassCount,
-                        DomainRulePolicy.RUSSIAN_RESOURCES_RULE in state.advancedSettings.bypassDomains),
-                    detail = tr(language, "всегда без VPN", "always without VPN"),
+                    detail = tr(language, "всегда без ВПН", "always without VPN"),
                     language = language,
                     backdrop = surfaceBackdrop,
                     liveGlassEnabled = liveGlassEnabled,

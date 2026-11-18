@@ -109,15 +109,23 @@ object VpnConfigFactory {
             .put("action", "sniff").put("sniffer", JSONArray().put("http").put("tls")
                 .apply { if (normalized.youtubeNoAdsEnabled) put("quic") }))
         rules.put(JSONObject().put("port", JSONArray().put(53)).put("action", "hijack-dns"))
+        // Dedicated resolver IPs also match when the HTTPS hostname is unavailable.
+        val dohDestinations = JSONArray()
+            .put(JSONObject().put("domain", JSONArray().put("dns.google")))
+            .put(JSONObject().put("domain_suffix", JSONArray().put("cloudflare-dns.com").put("one.one.one.one")))
+            .put(JSONObject().put("ip_cidr", JSONArray(listOf(
+                "8.8.8.8/32", "8.8.4.4/32", "2001:4860:4860::8888/128", "2001:4860:4860::8844/128",
+                "1.1.1.1/32", "1.0.0.1/32", "2606:4700:4700::1111/128", "2606:4700:4700::1001/128",
+            ))))
+        rules.put(JSONObject().put("type", "logical").put("mode", "and").put("rules", JSONArray()
+            .put(JSONObject().put("type", "logical").put("mode", "or").put("rules", dohDestinations))
+            .put(JSONObject().put("port", JSONArray().put(443)))
+            .put(JSONObject().put("network", JSONArray().put("tcp").put("udp")))).put("action", "reject"))
         russian?.let { rules.put(route(JSONObject(it.toString()), "direct")) }
         rules.put(route(JSONObject().put("ip_cidr", JSONArray(geodata.russianCidrs)), "direct"))
         rules
             .put(JSONObject().put("port", JSONArray().put(853)).put("network", JSONArray().put("tcp").put("udp"))
                 .put("action", "reject"))
-            .put(JSONObject().put("type", "logical").put("mode", "and").put("rules", JSONArray()
-                .put(JSONObject().put("domain_suffix", JSONArray().put("cloudflare-dns.com").put("one.one.one.one")))
-                .put(JSONObject().put("port", JSONArray().put(443)))
-                .put(JSONObject().put("network", JSONArray().put("tcp")))).put("action", "reject"))
             .put(route(JSONObject().put("ip_cidr", JSONArray(privateCidrs)), "direct"))
         val dnsRules = JSONArray()
         russian?.let { dnsRules.put(JSONObject(it.toString()).put("server", BOOTSTRAP_TAG)) }

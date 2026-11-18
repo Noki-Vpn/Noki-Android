@@ -98,16 +98,20 @@ internal class RuWireGuardConnectionCoordinator(
                 return@withTimeoutOrNull PreparedRuWireGuardConnection(cachedCredential, pair.privateKey, exit)
             }
             val eligible = eligibleExits(settings, inventory.foreignNodes)
-            val exitSamples = if (eligible.size > 1) sampler.measureNodes(eligible,
+            // An unscoped catalog only includes relays when they share the same entry overlay with its exits.
+            val sharedRelayCatalog = inventory.relays.isNotEmpty()
+            val exitSamples = if (!sharedRelayCatalog && eligible.size > 1) sampler.measureNodes(eligible,
                 { it.id }, { it.probeHost }, { it.probePort }, { it.probeIp }) else emptyMap()
             val exits = EndpointRankingPolicy.rankNodes(eligible, { it.id }, { exitSamples[it.id] },
                 { it.selectionWeight }, { it.metricsAt }, random = random)
             var lastFailure: Exception = BackendException("ru_relay_pair_unavailable", 503)
             var keyId: String? = null
             for (exit in exits) {
-                val catalog = try { api.ruRelayCatalog(token, device, deviceKey, exit.id) } catch (error: BackendException) {
+                val catalog = if (sharedRelayCatalog) inventory else try {
+                    api.ruRelayCatalog(token, device, deviceKey, exit.id)
+                } catch (error: BackendException) {
                     when (error.statusCode) {
-                        404 -> inventory // Older entry-route servers expose only the global inventory.
+                        404 -> inventory
                         503 -> { lastFailure = error; continue }
                         else -> throw error
                     }

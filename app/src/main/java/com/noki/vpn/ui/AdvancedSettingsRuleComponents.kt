@@ -274,13 +274,5 @@ internal fun domainLabel(language: AppLanguage, count: Int): String {
     }
 }
 
-internal fun bypassRuleSummary(language: AppLanguage, count: Int, builtInEnabled: Boolean): String {
-    val custom = customRuleSummary(language, count)
-    return if (builtInEnabled) {
-        val builtIn = tr(language, "Встроенный geosite", "Built-in geosite")
-        if (count == 0) builtIn else "$builtIn\n$custom"
-    } else if (count == 0) tr(language, "Нет активных правил", "No active rules") else custom
-}
-
 internal fun customRuleSummary(language: AppLanguage, count: Int): String =
     tr(language, "Правила пользователя: $count", "Custom rules: $count")

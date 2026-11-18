@@ -23,14 +23,22 @@ class RuWireGuardContractTest {
         for (newApi in listOf(true, false)) withCachedEntry(legacy = true) { context, repository, settings, exit, entry ->
             val cached = checkNotNull(repository.ruEntryForStop())
             var enrollments = 0
+            val requestedExits = mutableListOf<String?>()
             val client = OkHttpClient.Builder().addInterceptor { chain ->
                 val request = chain.request()
                 val response = when (request.url.encodedPath) {
-                    "/v1/vpn/ru-relays" -> JSONObject().put("route_version", 1).put("entry_node_id", JSONObject.NULL)
-                        .put("exit_node_id", request.url.queryParameter("exit_node_id") ?: JSONObject.NULL)
-                        .put("foreign_nodes", org.json.JSONArray().put(JSONObject().put("id", exit).put("name", "Exit").put("country_code", "NL")))
-                        .put("relays", org.json.JSONArray().put(JSONObject().put("id", entry).put("name", "Entry").put("country_code", "RU")
-                            .put("available", true).put("pair_ready", true).put("wireguard_endpoint", "203.0.113.5:51820")))
+                    "/v1/vpn/ru-relays" -> {
+                        val requestedExit = request.url.queryParameter("exit_node_id")
+                        requestedExits += requestedExit
+                        val relays = org.json.JSONArray()
+                        if (newApi || requestedExit != null) relays.put(JSONObject()
+                            .put("id", entry).put("name", "Entry").put("country_code", "RU")
+                            .put("available", true).put("pair_ready", true).put("wireguard_endpoint", "203.0.113.5:51820"))
+                        JSONObject().put("route_version", 1).put("entry_node_id", JSONObject.NULL)
+                            .put("exit_node_id", requestedExit ?: JSONObject.NULL)
+                            .put("foreign_nodes", org.json.JSONArray().put(JSONObject().put("id", exit).put("name", "Exit").put("country_code", "NL")))
+                            .put("relays", relays)
+                    }
                     "/v1/devices/challenge" -> JSONObject().put("device_id", settings.backendDeviceId).put("nonce", "nonce-1234567890123456")
                     "/v1/vpn/wireguard-keys" -> JSONObject().put("id", "55555555-5555-4555-8555-555555555555").put("public_key", cached.getString("public_key"))
                     "/v1/vpn/ru-entry" -> JSONObject(cached.toString()).also {
@@ -45,6 +53,7 @@ class RuWireGuardContractTest {
             val prepared = com.noki.vpn.vpn.RuWireGuardConnectionCoordinator(context, repository,
                 BackendApiClient(client, "https://api.example", challengeSigner = { "signature" }), challengeSigner = { "signature" }).prepare(settings)
             prepared.privateKey.fill(0)
+            assertEquals(if (newApi) listOf(null) else listOf(null, exit), requestedExits)
             assertEquals(1, enrollments)
             repository.stageRuEntryReleaseAfterStop(repository.ruEntryForStop())
             assertEquals(if (newApi) 1 else 0, repository.loadPendingRuEntryReleases().size)
@@ -158,7 +167,11 @@ class RuWireGuardContractTest {
                 val payload = when (request.url.encodedPath) {
                     "/v1/vpn/ru-relays" -> JSONObject().put("route_version", 1).put("entry_node_id", JSONObject.NULL)
                         .put("exit_node_id", request.url.queryParameter("exit_node_id") ?: JSONObject.NULL)
-                        .put("foreign_nodes", org.json.JSONArray().put(JSONObject().put("id", exit).put("name", "NL").put("country_code", "NL")))
+                        .put("foreign_nodes", org.json.JSONArray()
+                            .put(JSONObject().put("id", exit).put("name", "NL").put("country_code", "NL")
+                                .put("probe_host", "exit-nl.example").put("probe_port", 443))
+                            .put(JSONObject().put("id", "66666666-6666-4666-8666-666666666666").put("name", "LV")
+                                .put("country_code", "LV").put("probe_host", "exit-lv.example").put("probe_port", 443)))
                         .put("relays", org.json.JSONArray().put(JSONObject().put("id", fresh).put("name", "Fresh").put("country_code", "RU")
                             .put("available", true).put("pair_ready", true).put("probe_host", "fresh.example").put("probe_port", 25001))
                             .put(JSONObject().put("id", entry).put("name", "Cached").put("country_code", "RU").put("available", true)
@@ -182,7 +195,8 @@ class RuWireGuardContractTest {
                 BackendApiClient(client, "https://api.example", challengeSigner = { "signature" }), sampler, { "signature" }, { 0.0 }).prepare(settings) }
             assertEquals(listOf(fresh), attempts)
             assertEquals(setOf("fresh.example", "old.example"), measuredHosts.toSet())
-            assertEquals(2, requests.count { it.url.encodedPath == "/v1/vpn/ru-relays" })
+            assertEquals(listOf(null), requests.filter { it.url.encodedPath == "/v1/vpn/ru-relays" }
+                .map { it.url.queryParameter("exit_node_id") })
             if (entryStatus in listOf(200, 503)) {
                 val prepared = result.getOrThrow()
                 assertEquals(if (entryStatus == 200) fresh else entry, prepared.credential.relayNodeId)

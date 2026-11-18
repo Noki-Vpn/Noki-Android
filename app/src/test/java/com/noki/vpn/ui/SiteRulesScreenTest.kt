@@ -5,8 +5,6 @@ import androidx.activity.compose.setContent
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.fillMaxSize
-import androidx.compose.foundation.layout.fillMaxWidth
-import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
@@ -40,7 +38,7 @@ import org.robolectric.annotation.GraphicsMode
 class SiteRulesScreenTest {
     @get:Rule val compose = createEmptyComposeRule()
 
-    @Test fun restoredPresetButtonSavesOnOffOnAndItsSummaryDoesNotInventDomains() {
+    @Test fun restoredPresetButtonSavesOnOffOn() {
         val codec = StoredSettingsCodec { DefaultStoredSettingsFactory.create() }
         var raw = codec.encode(DefaultStoredSettingsFactory.create())
         var stored by mutableStateOf(codec.decode(raw))
@@ -50,9 +48,6 @@ class SiteRulesScreenTest {
             val enabled = preset in stored.advancedSettings.bypassDomains
             NokiTheme {
                 Column(Modifier.fillMaxSize().background(Color(0xFF07111A)).padding(21.dp)) {
-                    AdvancedDomainRuleWideCard("Всегда выключать", 0, "всегда без VPN", AppLanguage.RU,
-                        null, false, Modifier.fillMaxWidth().height(76.dp),
-                        summary = bypassRuleSummary(AppLanguage.RU, 0, enabled), onConfigure = {})
                     SiteRuleRow(preset, AppLanguage.RU, null, false, enabled, {}, {
                         val state = AppUiState(advancedSettings = stored.advancedSettings)
                         val next = if (enabled) AdvancedSettingsStateReducer.removeBypassDomain(state, preset)
@@ -63,20 +58,14 @@ class SiteRulesScreenTest {
                 }
             }
         }
-        compose.onNodeWithText("Встроенный geosite").assertIsDisplayed()
-        compose.onNodeWithText("0 доменов", substring = true).assertDoesNotExist()
         compose.onNodeWithText("on").performClick()
         compose.onNodeWithText("off").assertIsDisplayed()
-        compose.onNodeWithText("Нет активных правил").assertIsDisplayed()
         assertFalse(preset in codec.decode(raw).advancedSettings.bypassDomains)
         compose.runOnIdle { stored = codec.decode(raw) }
         compose.onNodeWithText("off").assertIsDisplayed()
         compose.onNodeWithText("off").performClick()
         compose.onNodeWithText("on").assertIsDisplayed()
-        compose.onNodeWithText("Встроенный geosite").assertIsDisplayed()
         assertEquals(listOf(preset), codec.decode(raw).advancedSettings.bypassDomains)
-        assertEquals("Встроенный geosite\nПравила пользователя: 2", bypassRuleSummary(AppLanguage.RU, 2, true))
-        assertEquals("Правила пользователя: 2", bypassRuleSummary(AppLanguage.RU, 2, false))
         controller.pause().stop().destroy()
     }
 }

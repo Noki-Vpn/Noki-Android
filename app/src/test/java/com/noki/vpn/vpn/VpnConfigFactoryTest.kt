@@ -367,7 +367,7 @@ class VpnConfigFactoryTest {
     @Test
     fun dnsAndBlocksRemainBeforeDirectAndDnsDialerUsesTheTunnel() {
         val config = JSONObject(VpnConfigFactory.build(profile(), AdvancedSettings(
-            bypassDomains = listOf(DomainRulePolicy.RUSSIAN_RESOURCES_RULE)), geosite))
+            bypassDomains = listOf(DomainRulePolicy.RUSSIAN_RESOURCES_RULE, "full:dns.google")), geosite))
         val rules = rules(config)
         val sniff = rules.single { it.optString("action") == "sniff" }
         val hijack = rules.single { it.optString("action") == "hijack-dns" }
@@ -378,16 +378,24 @@ class VpnConfigFactoryTest {
         assertTrue(rules.indexOf(sniff) < rules.indexOf(hijack))
         assertTrue(rules.indexOf(hijack) < rules.indexOf(dot))
         assertTrue(rules.indexOf(dot) < rules.indexOf(privateNetworks))
-        assertTrue(rules.indexOf(doh) < rules.indexOf(privateNetworks))
+        assertEquals(rules.indexOf(hijack) + 1, rules.indexOf(doh))
+        assertTrue(rules.indexOf(doh) < rules.indexOfFirst { it.optString("outbound") == "direct" })
         assertEquals("reject", dot.getString("action"))
         assertEquals("and", doh.getString("mode"))
         assertEquals("reject", doh.getString("action"))
         assertEquals("direct", privateNetworks.getString("outbound"))
         val constraints = doh.getJSONArray("rules")
+        assertEquals("or", constraints.getJSONObject(0).getString("mode"))
+        val destinations = constraints.getJSONObject(0).getJSONArray("rules")
+        assertEquals("[\"dns.google\"]", destinations.getJSONObject(0).getJSONArray("domain").toString())
         assertEquals("[\"cloudflare-dns.com\",\"one.one.one.one\"]",
-            constraints.getJSONObject(0).getJSONArray("domain_suffix").toString())
+            destinations.getJSONObject(1).getJSONArray("domain_suffix").toString())
+        val cidrs = destinations.getJSONObject(2).getJSONArray("ip_cidr")
+        assertEquals(setOf("8.8.8.8/32", "8.8.4.4/32", "2001:4860:4860::8888/128", "2001:4860:4860::8844/128",
+            "1.1.1.1/32", "1.0.0.1/32", "2606:4700:4700::1111/128", "2606:4700:4700::1001/128"),
+            (0 until cidrs.length()).map(cidrs::getString).toSet())
         assertEquals("[443]", constraints.getJSONObject(1).getJSONArray("port").toString())
-        assertEquals("[\"tcp\"]", constraints.getJSONObject(2).getJSONArray("network").toString())
+        assertEquals("[\"tcp\",\"udp\"]", constraints.getJSONObject(2).getJSONArray("network").toString())
         val dns = config.getJSONObject("dns")
         val servers = dns.getJSONArray("servers")
         val server = (0 until servers.length()).map(servers::getJSONObject).single { it.optString("tag") == "noki-node-dns" }
@@ -553,7 +561,7 @@ class VpnConfigFactoryTest {
         assertEquals(2, dns.length())
         assertEquals("1.1.1.1", dns.getJSONObject(0).getString("server"))
         assertEquals("local", dns.getJSONObject(1).getString("type"))
-        assertFalse(config.toString().contains("8.8.8.8"))
+        assertFalse(dns.toString().contains("8.8.8.8"))
     }
 
     @Test

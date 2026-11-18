@@ -91,15 +91,16 @@ internal fun SecurityAndroidVersionBlock(
             Column(
                 modifier = Modifier
                     .weight(1f)
-                    .padding(end = metrics.dp(12f)),
+                    .padding(end = if (required) 0.dp else metrics.dp(12f)),
                 verticalArrangement = Arrangement.spacedBy(metrics.dp(5f)),
             ) {
                 SecurityText(
                     text = title,
-                    fontSize = 18f,
-                    lineHeight = 21.6f,
+                    fontSize = if (required) 16f else 18f,
+                    lineHeight = if (required) 19.2f else 21.6f,
                     letterSpacing = 0f,
                     fontWeight = FontWeight.Normal,
+                    maxLines = if (required) Int.MAX_VALUE else 1,
                     modifier = Modifier.fillMaxWidth(),
                 )
                 SecurityText(
