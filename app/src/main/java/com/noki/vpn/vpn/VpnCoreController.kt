@@ -84,8 +84,9 @@ internal class VpnCoreController(
         server = null
         ruDiagnosticLog = null
         if (core != null) runCatching {
-            core.cancelMeasureDelay()
-            try { core.closeService() } finally { core.close() }
+            try { core.cancelMeasureDelay() } finally {
+                try { core.closeService() } finally { core.close() }
+            }
         }.onFailure { SafeLog.e(TAG, "Failed to stop VPN core", it) }
         flushRuDiagnostics(diagnostics, close = true)
         tunFd = -1

@@ -632,6 +632,38 @@ class AppVpnServiceCommandTest {
     }
 
     @Test
+    fun ruToggleOffReleasesTheExactStoppedEntryEvenWhenDirectStartupFails() = runBlocking {
+        val fixture = Fixture(this)
+        fixture.setNetworkAvailability(UnderlyingNetworkAvailability.Validated)
+        val session = ruSession(System.currentTimeMillis() + 3_600_000L)
+        val credential = com.noki.vpn.data.RuEntryCredential(session.identity.relayNodeId,
+            session.wireguard.copy(address = "10.240.1.2/32"), "10.240.1.1",
+            System.currentTimeMillis() + 3_600_000L, session.identity.publicKeyId, 7)
+        fixture.useRuSession(session, credential)
+        val repository = SettingsRepository(fixture.service)
+        val settings = repository.load()
+        repository.saveRuEntry("account", settings.backendDeviceId, "persistent-public-key", credential, emptyList())
+        androidx.work.testing.WorkManagerTestInitHelper.initializeTestWorkManager(fixture.service)
+        fixture.selectRuForNextStart(false)
+        var directAttempted = false
+        fixture.useOfflinePreparation(onPrepare = {
+            directAttempted = true
+            assertFalse(fixture.runtimeRunning)
+            assertNull(repository.ruEntryForStop())
+        })
+        fixture.invoke("restartVpn", VpnPreparationStrategy.FreshOnly)
+        fixture.orchestrator.activeTransitionJob()!!.join()
+        assertTrue(directAttempted)
+        assertTrue(fixture.runtimeStops > 0)
+        assertNull(fixture.ruSession())
+        val pending = repository.loadPendingRuEntryReleases().single()
+        assertEquals(credential.relayNodeId, pending.getString("relay_node_id"))
+        assertEquals(credential.publicKeyId, pending.getString("public_key_id"))
+        assertEquals(7L, pending.getLong("lease_generation"))
+        assertEquals("10.240.1.2/32", pending.getJSONObject("wireguard").getString("address"))
+    }
+
+    @Test
     fun ruDisconnectKeepsRenewableEntryCredentialAndDoesNotStageSessionRevoke() = runBlocking {
         val fixture = Fixture(this)
         fixture.useRuSession(ruSession())
@@ -2498,6 +2530,13 @@ class AppVpnServiceCommandTest {
             }.build(), "https://api.example"))
         }
 
+        fun selectRuForNextStart(enabled: Boolean) {
+            val selected = SettingsRepository(service).updateSettings { current -> current.copy(
+                advancedSettings = current.advancedSettings.copy(ruRelayEnabled = enabled),
+            ) }
+            store.updateSettings { selected }
+        }
+
         fun recordNetworkRegistrations(onRegister: () -> Unit = {}): MutableList<() -> Unit> {
             val callbacks = mutableListOf<() -> Unit>()
             set("networkMonitor", VpnNetworkMonitor(
@@ -2565,7 +2604,7 @@ class AppVpnServiceCommandTest {
             ))
         }
 
-        fun useRuSession(session: BackendRuWireGuardSession.Ready) {
+        fun useRuSession(session: BackendRuWireGuardSession.Ready, entryCredential: com.noki.vpn.data.RuEntryCredential? = null) {
             val settings = SettingsRepository(service).updateSettings {
                 it.copy(isAuthenticated = true, backendAccessToken = "lease-access",
                     backendDeviceId = "66666666-6666-4666-8666-666666666666", backendDeviceKey = "dev_" + "1".repeat(64),
@@ -2574,7 +2613,7 @@ class AppVpnServiceCommandTest {
             }
             store.updateSettings { settings }
             orchestrator.updateSettings(settings)
-            val credential = com.noki.vpn.data.RuEntryCredential(session.identity.relayNodeId,
+            val credential = entryCredential ?: com.noki.vpn.data.RuEntryCredential(session.identity.relayNodeId,
                 session.wireguard, "10.240.0.1", session.identity.leaseExpiresAtEpochMillis ?: Long.MAX_VALUE)
             val activeRoute = AppVpnService::class.java.declaredClasses.single { it.simpleName == "ActiveRuRoute" }
                 .declaredConstructors.single().apply { isAccessible = true }
@@ -2762,7 +2801,7 @@ class AppVpnServiceCommandTest {
                 if (result === COROUTINE_SUSPENDED) COROUTINE_SUSPENDED else Unit
             }
         }
-        fun stop(startId: Int) = invoke("stopVpn", startId, false)
+        fun stop(startId: Int) = invoke("stopVpn", startId, false, true)
 
         fun pendingStart(): Any? = AppVpnService::class.java.getDeclaredField("pendingStartOptions")
             .apply { isAccessible = true }.get(service)

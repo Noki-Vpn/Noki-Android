@@ -143,6 +143,46 @@ class SettingsRepository(private val context: Context) : VpnSessionStore, Endpoi
         }
     }
 
+    internal fun ruEntryForStop(): JSONObject? = preferences.getString("ru_entry_credential", null)?.let { encrypted ->
+        runCatching { JSONObject(checkNotNull(cipher.decrypt(encrypted))) }.getOrNull()
+    }
+
+    private fun ruEntryReleaseOwner(entry: JSONObject): List<String> = listOf(
+        entry.optString("user_id"), entry.optString("device_id"), entry.optString("relay_node_id"),
+        entry.optString("public_key_id"), entry.getJSONObject("wireguard").getString("address"),
+    )
+
+    internal fun loadPendingRuEntryReleases(): List<JSONObject> = synchronized(RU_WIREGUARD_REVOKE_LOCK) {
+        val encrypted = preferences.getString("ru_entry_pending_releases", null) ?: return@synchronized emptyList()
+        val array = JSONArray(checkNotNull(cipher.decrypt(encrypted)))
+        (0 until array.length()).map(array::getJSONObject)
+    }
+
+    internal fun stageRuEntryReleaseAfterStop(entry: JSONObject?) = synchronized(RU_WIREGUARD_REVOKE_LOCK) {
+        val editor = preferences.edit()
+        val credential = entry?.let { runCatching { RuWireGuardSessionJsonParser.parseEntryCredential(it) }.getOrNull() }
+        if (entry != null && credential?.publicKeyId != null && credential.leaseGeneration != null) {
+            val owner = ruEntryReleaseOwner(entry)
+            val pending = loadPendingRuEntryReleases()
+            val newer = pending.any { ruEntryReleaseOwner(it) == owner && it.getLong("lease_generation") > credential.leaseGeneration }
+            if (!newer) editor.putString("ru_entry_pending_releases", cipher.encrypt(JSONArray(
+                pending.filterNot { ruEntryReleaseOwner(it) == owner } + entry,
+            ).toString()))
+        }
+        if (ruEntryForStop()?.toString() == entry?.toString()) editor.remove("ru_entry_credential")
+        check(editor.commit()) { "ru_entry_release_persist_failed" }
+    }
+
+    internal fun clearPendingRuEntryRelease(entry: JSONObject) = synchronized(RU_WIREGUARD_REVOKE_LOCK) {
+        val remaining = loadPendingRuEntryReleases().filterNot {
+            ruEntryReleaseOwner(it) == ruEntryReleaseOwner(entry) && it.getLong("lease_generation") == entry.getLong("lease_generation")
+        }
+        val editor = preferences.edit()
+        if (remaining.isEmpty()) editor.remove("ru_entry_pending_releases")
+        else editor.putString("ru_entry_pending_releases", cipher.encrypt(JSONArray(remaining).toString()))
+        check(editor.commit()) { "ru_entry_release_clear_failed" }
+    }
+
     internal fun saveRuEntry(userId: String, deviceId: String, publicKey: String, credential: RuEntryCredential, exits: List<RuForeignNode>) {
         val json = RuWireGuardSessionJsonParser.encodeEntryCredential(credential)
             .put("user_id", userId).put("device_id", deviceId).put("public_key", publicKey)

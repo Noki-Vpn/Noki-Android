@@ -16,6 +16,7 @@ import com.noki.vpn.data.RuEntryCredential
 import com.noki.vpn.data.RuWireGuardSessionJsonParser
 import com.noki.vpn.data.DeviceIdentity
 import com.noki.vpn.data.BackendException
+import com.noki.vpn.data.AuthTokenRefresher
 import com.noki.vpn.data.PendingRuWireGuardRevoke
 import com.noki.vpn.data.ServerSelectionMode
 import com.noki.vpn.data.SettingsRepository
@@ -80,7 +81,7 @@ internal class RuWireGuardConnectionCoordinator(
             val userId = settings.userProfile.backendUserId
             val cached = repository.readRuEntry(userId, device, publicKey)
             val cachedCredential = cached?.let { RuWireGuardSessionJsonParser.parseEntryCredential(it) }
-                ?.takeIf { it.expiresAtEpochMillis > System.currentTimeMillis() }
+                ?.takeIf { it.expiresAtEpochMillis > System.currentTimeMillis() && it.publicKeyId != null && it.leaseGeneration != null }
             val savedExits = cached?.getJSONArray("exits")?.let { array ->
                 (0 until array.length()).map { index ->
                     val item = array.getJSONObject(index)
@@ -176,7 +177,7 @@ class PendingRuWireGuardRevokeWorker(
     override suspend fun doWork(): Result {
         val repository = SettingsRepository(applicationContext)
         val pending = repository.loadPendingRuWireGuardRevokes().filterNot { it.provisional }
-        if (pending.isEmpty()) return Result.success()
+        if (pending.isEmpty() && repository.loadPendingRuEntryReleases().isEmpty()) return Result.success()
         val physical = AndroidUnderlyingNetworkSource(applicationContext).currentObservation().candidate?.network
             ?: return Result.retry()
         val api = BackendApiClient().onNetwork(physical)
@@ -185,6 +186,7 @@ class PendingRuWireGuardRevokeWorker(
             if (revokePendingRuWireGuardSession(api, entry)) repository.clearPendingRuWireGuardRevoke(entry.sessionId)
             else failed = true
         }
+        if (!retryPendingRuEntryReleases(repository, api)) failed = true
         return if (failed) Result.retry() else Result.success()
     }
 
@@ -200,6 +202,40 @@ class PendingRuWireGuardRevokeWorker(
         }
     }
 }
+
+internal suspend fun retryPendingRuEntryReleases(
+    repository: SettingsRepository,
+    api: BackendApiClient,
+    challengeSigner: (String) -> String = DeviceIdentity::signChallenge,
+): Boolean = withTimeoutOrNull(5_000L) {
+    val settings = repository.load()
+    val userId = settings.userProfile.backendUserId
+    val deviceId = settings.backendDeviceId
+    val pending = repository.loadPendingRuEntryReleases().filter {
+        it.optString("user_id") == userId && it.optString("device_id") == deviceId
+    }
+    if (pending.isEmpty()) return@withTimeoutOrNull true
+    try { AuthTokenRefresher(repository, api).refreshExpiringStoredTokens() }
+    catch (cancelled: CancellationException) { throw cancelled }
+    catch (_: Exception) { return@withTimeoutOrNull false }
+    var completed = true
+    for (entry in pending) {
+        try {
+            val current = repository.load()
+            check(current.userProfile.backendUserId == userId && current.backendDeviceId == deviceId) { "account_changed" }
+            val token = checkNotNull(current.backendAccessToken?.takeIf(String::isNotBlank)) { "auth_required" }
+            val credential = RuWireGuardSessionJsonParser.parseEntryCredential(entry)
+            DeviceIdentity.withChallengeTransaction {
+                val proof = api.createDeviceChallenge(token, deviceId)
+                check(repository.load().let { it.userProfile.backendUserId == userId && it.backendDeviceId == deviceId }) { "account_changed" }
+                api.releaseRuEntry(token, deviceId, current.backendDeviceKey, proof.nonce, challengeSigner(proof.nonce), credential)
+            }
+            repository.clearPendingRuEntryRelease(entry)
+        } catch (cancelled: CancellationException) { throw cancelled }
+        catch (_: Exception) { completed = false }
+    }
+    completed
+} ?: false
 
 internal suspend fun revokePendingRuWireGuardSession(
     api: BackendApiClient,

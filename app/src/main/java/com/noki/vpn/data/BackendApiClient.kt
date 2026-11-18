@@ -528,6 +528,18 @@ class BackendApiClient(
         expectedRelay = relayNodeId,
     )
 
+    internal suspend fun releaseRuEntry(
+        token: String, deviceId: String, deviceKey: String, nonce: String, signature: String,
+        credential: RuEntryCredential,
+    ) {
+        val keyId = credential.publicKeyId ?: return
+        val generation = credential.leaseGeneration ?: return
+        postJson("/vpn/ru-entry/release", JSONObject().put("device_id", deviceId).put("device_key", deviceKey)
+            .put("device_nonce", nonce).put("device_signature", signature)
+            .put("relay_node_id", canonicalRuUuid(credential.relayNodeId)).put("public_key_id", canonicalRuUuid(keyId))
+            .put("client_address", credential.wireguard.address.removeSuffix("/32")).put("lease_generation", generation), token)
+    }
+
     override suspend fun createRuWireGuardSession(
         token: String,
         request: RuWireGuardSessionRequest,

@@ -19,6 +19,82 @@ import com.noki.vpn.vpn.awaitRuWireGuardReady
 @org.junit.runner.RunWith(org.robolectric.RobolectricTestRunner::class)
 @org.robolectric.annotation.Config(sdk = [28])
 class RuWireGuardContractTest {
+    @Test fun legacyCachedEntryEnrollsBeforeItsFirstDisconnectAndOldApiStillConnects() = runBlocking {
+        for (newApi in listOf(true, false)) withCachedEntry(legacy = true) { context, repository, settings, exit, entry ->
+            val cached = checkNotNull(repository.ruEntryForStop())
+            var enrollments = 0
+            val client = OkHttpClient.Builder().addInterceptor { chain ->
+                val request = chain.request()
+                val response = when (request.url.encodedPath) {
+                    "/v1/vpn/ru-relays" -> JSONObject().put("route_version", 1).put("entry_node_id", JSONObject.NULL)
+                        .put("exit_node_id", request.url.queryParameter("exit_node_id") ?: JSONObject.NULL)
+                        .put("foreign_nodes", org.json.JSONArray().put(JSONObject().put("id", exit).put("name", "Exit").put("country_code", "NL")))
+                        .put("relays", org.json.JSONArray().put(JSONObject().put("id", entry).put("name", "Entry").put("country_code", "RU")
+                            .put("available", true).put("pair_ready", true).put("wireguard_endpoint", "203.0.113.5:51820")))
+                    "/v1/devices/challenge" -> JSONObject().put("device_id", settings.backendDeviceId).put("nonce", "nonce-1234567890123456")
+                    "/v1/vpn/wireguard-keys" -> JSONObject().put("id", "55555555-5555-4555-8555-555555555555").put("public_key", cached.getString("public_key"))
+                    "/v1/vpn/ru-entry" -> JSONObject(cached.toString()).also {
+                        enrollments++
+                        if (newApi) it.put("public_key_id", "55555555-5555-4555-8555-555555555555").put("lease_generation", 2)
+                    }
+                    else -> error("unexpected route")
+                }
+                Response.Builder().request(request).protocol(Protocol.HTTP_1_1).code(200).message("OK")
+                    .body(response.toString().toResponseBody("application/json".toMediaType())).build()
+            }.build()
+            val prepared = com.noki.vpn.vpn.RuWireGuardConnectionCoordinator(context, repository,
+                BackendApiClient(client, "https://api.example", challengeSigner = { "signature" }), challengeSigner = { "signature" }).prepare(settings)
+            prepared.privateKey.fill(0)
+            assertEquals(1, enrollments)
+            repository.stageRuEntryReleaseAfterStop(repository.ruEntryForStop())
+            assertEquals(if (newApi) 1 else 0, repository.loadPendingRuEntryReleases().size)
+            assertEquals(null, repository.ruEntryForStop())
+        }
+    }
+
+    @Test fun stoppedEntryClearsCacheKeepsTheKeyAndLateCompletionPreservesNewerAndOtherRelayReleases() = runBlocking {
+        withCachedEntry { context, repository, settings, exit, _ ->
+            val pair = WireGuardKeyStore.android(context).getOrCreate()
+            val publicKey = pair.publicKeyBase64().also { pair.privateKey.fill(0) }
+            val original = RuWireGuardSessionJsonParser.parseEntryCredential(checkNotNull(repository.ruEntryForStop()))
+            val old = checkNotNull(repository.ruEntryForStop())
+            repository.stageRuEntryReleaseAfterStop(old)
+            assertEquals(null, repository.readRuEntry("account", settings.backendDeviceId, publicKey))
+            val newer = original.copy(leaseGeneration = 2)
+            repository.saveRuEntry("account", settings.backendDeviceId, publicKey, newer, listOf(RuForeignNode(exit, "Exit", "NL")))
+            repository.stageRuEntryReleaseAfterStop(repository.ruEntryForStop())
+            repository.clearPendingRuEntryRelease(old)
+            assertEquals(2L, repository.loadPendingRuEntryReleases().single().getLong("lease_generation"))
+            val another = original.copy(relayNodeId = "44444444-4444-4444-8444-444444444444")
+            repository.saveRuEntry("account", settings.backendDeviceId, publicKey, another, emptyList())
+            repository.stageRuEntryReleaseAfterStop(repository.ruEntryForStop())
+            assertEquals(2, repository.loadPendingRuEntryReleases().size)
+            val stable = WireGuardKeyStore.android(context).getOrCreate()
+            assertEquals(publicKey, stable.publicKeyBase64())
+            stable.privateKey.fill(0)
+        }
+    }
+
+    @Test fun releaseSendsTheAddressGenerationAndDeviceProofAndAcceptsAnAlreadyReleasedTuple() = runBlocking {
+        withCachedEntry { _, repository, settings, _, _ ->
+            val credential = RuWireGuardSessionJsonParser.parseEntryCredential(checkNotNull(repository.ruEntryForStop()))
+            var sent: JSONObject? = null
+            val client = OkHttpClient.Builder().addInterceptor { chain ->
+                assertEquals("/v1/vpn/ru-entry/release", chain.request().url.encodedPath)
+                sent = JSONObject(Buffer().also { chain.request().body!!.writeTo(it) }.readUtf8())
+                Response.Builder().request(chain.request()).protocol(Protocol.HTTP_1_1).code(200).message("OK")
+                    .body("{\"released\":false}".toResponseBody("application/json".toMediaType())).build()
+            }.build()
+            BackendApiClient(client, "https://api.example").releaseRuEntry("access", settings.backendDeviceId,
+                settings.backendDeviceKey, "nonce", "signature", credential)
+            assertEquals("10.240.1.2", sent!!.getString("client_address"))
+            assertEquals(1L, sent!!.getLong("lease_generation"))
+            assertEquals(credential.publicKeyId, sent!!.getString("public_key_id"))
+            assertEquals(setOf("device_id", "device_key", "device_nonce", "device_signature", "relay_node_id", "public_key_id", "client_address", "lease_generation"),
+                sent!!.keys().asSequence().toSet())
+        }
+    }
+
     @Test fun cachedIngressRequiresTheSameAuthoritativeWireGuardEndpoint() = runBlocking {
         for (advertised in listOf("203.0.113.5:51820", "203.0.113.9:51820", null)) withCachedEntry { context, repository, settings, exit, entry ->
             val pair = WireGuardKeyStore.android(context).getOrCreate()
@@ -117,7 +193,7 @@ class RuWireGuardContractTest {
         }
     }
 
-    private suspend fun withCachedEntry(action: suspend (android.content.Context, SettingsRepository, StoredSettings, String, String) -> Unit) {
+    private suspend fun withCachedEntry(legacy: Boolean = false, action: suspend (android.content.Context, SettingsRepository, StoredSettings, String, String) -> Unit) {
         val context = org.robolectric.RuntimeEnvironment.getApplication()
         val provider = object : java.security.Provider("RuSelectionTest", 1.0, "Test-only Android keystore") {
             init { put("KeyStore.AndroidKeyStore", com.noki.vpn.vpn.AppVpnServiceCommandTest.InMemoryAndroidKeyStore::class.java.name) }
@@ -137,10 +213,12 @@ class RuWireGuardContractTest {
                 userProfile = base.userProfile.copy(backendUserId = "account", serverSelectionMode = ServerSelectionMode.AUTO),
                 advancedSettings = base.advancedSettings.copy(ruRelayEnabled = true)) }
             val repository = SettingsRepository(context)
+            context.getSharedPreferences(SETTINGS_PREFERENCES_NAME, android.content.Context.MODE_PRIVATE).edit().clear().commit()
             repository.updateSettings { settings }
             repository.saveRuEntry("account", device, pair.publicKeyBase64(), RuEntryCredential(entry,
                 BackendRuWireGuardConfig("203.0.113.5:51820", java.util.Base64.getEncoder().encodeToString(ByteArray(32) { 9 }),
-                    "10.240.1.2/32", listOf("10.240.1.1"), 1280, listOf("0.0.0.0/0")), "10.240.1.1", System.currentTimeMillis() + 120_000),
+                    "10.240.1.2/32", listOf("10.240.1.1"), 1280, listOf("0.0.0.0/0")), "10.240.1.1", System.currentTimeMillis() + 120_000,
+                if (legacy) null else "55555555-5555-4555-8555-555555555555", if (legacy) null else 1),
                 listOf(RuForeignNode(exit, "Exit", "NL")))
             val reloadedPair = WireGuardKeyStore.android(context).getOrCreate()
             assertEquals(pair.publicKeyBase64(), reloadedPair.publicKeyBase64())

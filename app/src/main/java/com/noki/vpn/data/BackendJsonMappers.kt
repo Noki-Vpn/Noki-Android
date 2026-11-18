@@ -363,13 +363,17 @@ internal object RuWireGuardSessionJsonParser {
         require(address.startsWith("10.240.") && address != gateway && gateway == address.substringBeforeLast('.') + ".1") {
             "ru_entry_gateway_invalid"
         }
-        return RuEntryCredential(relay, wireguard, gateway, Instant.parse(json.getString("expires_at")).toEpochMilli())
+        val keyId = json.optString("public_key_id").takeIf { it.isNotBlank() }?.let(::canonicalRuUuid)
+        val generation = if (json.has("lease_generation") && !json.isNull("lease_generation")) json.getLong("lease_generation") else null
+        require((keyId == null) == (generation == null) && (generation == null || generation > 0)) { "ru_entry_generation_invalid" }
+        return RuEntryCredential(relay, wireguard, gateway, Instant.parse(json.getString("expires_at")).toEpochMilli(), keyId, generation)
     }
 
     internal fun encodeEntryCredential(credential: RuEntryCredential): JSONObject {
         val wireguard = credential.wireguard
         return JSONObject().put("relay_node_id", credential.relayNodeId).put("route_gateway", credential.routeGateway)
             .put("expires_at", Instant.ofEpochMilli(credential.expiresAtEpochMillis).toString())
+            .put("public_key_id", credential.publicKeyId).put("lease_generation", credential.leaseGeneration)
             .put("wireguard", JSONObject().put("endpoint", wireguard.endpoint).put("server_public_key", wireguard.serverPublicKey)
                 .put("address", wireguard.address).put("dns", JSONArray(wireguard.dns)).put("mtu", wireguard.mtu)
                 .put("allowed_ips", JSONArray(wireguard.allowedIps)))

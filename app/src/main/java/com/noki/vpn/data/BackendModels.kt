@@ -360,6 +360,8 @@ internal data class RuEntryCredential(
     val wireguard: BackendRuWireGuardConfig,
     val routeGateway: String,
     val expiresAtEpochMillis: Long,
+    val publicKeyId: String? = null,
+    val leaseGeneration: Long? = null,
 )
 
 data class BackendRuWireGuardConfig(
