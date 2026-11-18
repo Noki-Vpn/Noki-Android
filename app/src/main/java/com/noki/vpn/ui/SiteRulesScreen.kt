@@ -73,9 +73,6 @@ internal fun siteRuleValidationError(
     }
     val normalized = DomainRulePolicy.normalize(value)
         ?: return tr(language, "Введите корректный домен", "Enter a valid domain")
-    if (normalized == DomainRulePolicy.RUSSIAN_RESOURCES_RULE) {
-        return tr(language, "Российские ресурсы всегда идут напрямую", "Russian resources always go directly")
-    }
     val editingNormalized = editingDomain?.let(DomainRulePolicy::normalize)
     val duplicate = normalized != editingNormalized &&
         domains.any { DomainRulePolicy.normalize(it) == normalized }
@@ -237,13 +234,20 @@ fun SiteRulesScreen(
                                     language = language,
                                     backdrop = sharedBackdrop,
                                     liveGlassEnabled = liveGlassEnabled,
+                                    russianResourcesEnabled = DomainRulePolicy.RUSSIAN_RESOURCES_RULE in domains,
                                     onEdit = {},
-                                    onDelete = {},
+                                    onDelete = {
+                                        if (DomainRulePolicy.RUSSIAN_RESOURCES_RULE in domains) {
+                                            viewModel.removeBypassDomain(DomainRulePolicy.RUSSIAN_RESOURCES_RULE)
+                                        } else {
+                                            viewModel.addBypassDomain(DomainRulePolicy.RUSSIAN_RESOURCES_RULE)
+                                        }
+                                    },
                                 )
                             }
                         }
                         items(
-                            items = domains.filterNot { it == DomainRulePolicy.RUSSIAN_RESOURCES_RULE },
+                            items = domains.filterNot { mode == SiteRulesMode.BYPASS && it == DomainRulePolicy.RUSSIAN_RESOURCES_RULE },
                             key = { it },
                             contentType = { "site-rule-row" },
                         ) { domain ->
@@ -373,16 +377,17 @@ private fun SiteRulesEditorCard(
 }
 
 @Composable
-private fun SiteRuleRow(
+internal fun SiteRuleRow(
     domain: String,
     language: AppLanguage,
     backdrop: PrismalGlassLayer?,
     liveGlassEnabled: Boolean,
+    russianResourcesEnabled: Boolean? = null,
     onEdit: () -> Unit,
     onDelete: () -> Unit,
 ) {
     val metrics = nokiAdaptiveMetrics(LocalConfiguration.current.screenWidthDp.dp)
-    val russianResources = domain == DomainRulePolicy.RUSSIAN_RESOURCES_RULE
+    val russianResources = russianResourcesEnabled != null && domain == DomainRulePolicy.RUSSIAN_RESOURCES_RULE
     SiteRulesCard(
         backdrop = backdrop,
         liveGlassEnabled = liveGlassEnabled,
@@ -408,12 +413,12 @@ private fun SiteRuleRow(
             )
             Row(horizontalArrangement = Arrangement.spacedBy(metrics.dp(7f))) {
                 if (russianResources) {
-                    SiteRulesText(
-                        text = tr(language, "Всегда напрямую", "Always direct"),
-                        fontSize = 13f,
-                        lineHeight = 16f,
-                        color = SiteRulesTextPrimary,
-                        modifier = Modifier,
+                    SiteRulesButton(
+                        text = if (russianResourcesEnabled == true) "on" else "off",
+                        danger = russianResourcesEnabled != true,
+                        active = russianResourcesEnabled == true,
+                        modifier = Modifier.width(metrics.dp(54f)).height(metrics.dp(40f)),
+                        onClick = onDelete,
                     )
                 } else {
                     SiteRulesButton(

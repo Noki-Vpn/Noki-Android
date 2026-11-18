@@ -27,6 +27,35 @@ import org.robolectric.annotation.Config
 @RunWith(RobolectricTestRunner::class)
 @Config(sdk = [28])
 class YoutubeConnectionTest {
+    @Test fun promotedEndpointRevokesOldGrantsAndRecreatesAtMostTwicePerStart() = runBlocking {
+        val creates = AtomicInteger()
+        val renewals = AtomicInteger()
+        val fixture = Fixture(responseCode = { if (it.url.encodedPath.endsWith("/renew")) 409 else 200 }) { request ->
+            if (request.url.encodedPath.endsWith("/renew")) {
+                renewals.incrementAndGet()
+                JSONObject().put("detail", "youtube_wireguard_identity_changed")
+            } else {
+                val number = creates.incrementAndGet()
+                youtubeAccessFixture(expiresAt = System.currentTimeMillis() + 450).put("grant_id",
+                    "00000000-0000-4000-8000-${number.toString().padStart(12, '0')}")
+            }
+        }
+        try {
+            fixture.connection.start(settings())
+            waitUntil { creates.get() == 3 && renewals.get() == 3 }
+            delay(500)
+            assertEquals(3, creates.get())
+            assertNull(fixture.connection.configFor(settings()))
+            val requests = fixture.requests.toList()
+            assertEquals(2, requests.count { it.method == "DELETE" })
+            val admissions = requests.filter { it.url.encodedPath == "/v1/vpn/youtube-access" }
+            assertEquals(3, admissions.map { request -> JSONObject(okio.Buffer().also { request.body!!.writeTo(it) }.readUtf8()).getString("request_id") }.toSet().size)
+            for (index in 1..2) {
+                val revoke = requests.indexOfFirst { it.method == "DELETE" && it.url.encodedPath.endsWith(index.toString().padStart(12, '0')) }
+                assertTrue(revoke in 0 until requests.indexOf(admissions[index]))
+            }
+        } finally { fixture.close() }
+    }
     @Test fun newGrantDiscoversAllowedNodesOnceAndRenewKeepsItsSelection() = runBlocking {
         val renewals = AtomicInteger()
         val node = "55555555-5555-4555-8555-555555555555"
@@ -288,6 +317,7 @@ class YoutubeConnectionTest {
         nodes: JSONObject = JSONObject().put("nodes", org.json.JSONArray()),
         catalogStatus: Int = 200,
         measure: suspend (List<VpnServer>) -> Map<String, Int> = { emptyMap() },
+        responseCode: (Request) -> Int = { 200 },
         response: (Request) -> JSONObject,
     ) {
         val scope = CoroutineScope(SupervisorJob() + Dispatchers.Unconfined)
@@ -310,7 +340,7 @@ class YoutubeConnectionTest {
                 else -> response(request)
             }
             Response.Builder().request(request).protocol(Protocol.HTTP_1_1)
-                .code(if (request.url.encodedPath == "/v1/vpn/youtube-nodes") catalogStatus else 200).message("OK")
+                .code(if (request.url.encodedPath == "/v1/vpn/youtube-nodes") catalogStatus else responseCode(request)).message("OK")
                 .body(payload.toString().toResponseBody("application/json".toMediaType())).build()
         }.build()
         val connection = YoutubeConnection(context, scope, repository,

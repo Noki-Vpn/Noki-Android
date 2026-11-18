@@ -11,6 +11,15 @@ import org.junit.Assert.assertTrue
 import org.junit.Test
 
 class ClientLatencyRequestTargetTest {
+    @Test fun changedPhysicalProbeAddressCannotReuseAnotherRuPing() {
+        val before = RuForeignNode("node", "Exit", "NL", probeIp = "203.0.113.1")
+        val after = before.copy(probeIp = "203.0.113.2")
+        assertNotEquals(clientLatencyRequestTarget(emptyList(), true, listOf(before)),
+            clientLatencyRequestTarget(emptyList(), true, listOf(after)))
+        val state = BackendSyncCoordinator.withCachedClientLatencies(AppUiState(ruForeignNodes = listOf(after)),
+            mapOf(clientLatencyTargetKey(before) to 20))
+        assertNull(state.ruForeignNodes.single().latencyMs)
+    }
     @Test
     fun `direct and relay requests cannot reuse the same latency job`() {
         val locations = listOf(location("lv", "lv.example"))
@@ -21,7 +30,7 @@ class ClientLatencyRequestTargetTest {
     @Test
     fun `relay latency belongs to distinct available exits`() {
         val nodes = listOf(RuForeignNode("exit-b", "Other", "NL"), RuForeignNode("exit-a", "Exit", "LV"))
-        assertEquals(listOf("ru:1:exit-a", "ru:1:exit-b"),
+        assertEquals(nodes.map(::clientLatencyTargetKey).sorted(),
             clientLatencyRequestTarget(emptyList(), true, nodes + nodes.first()))
         assertTrue(clientLatencyRequestTarget(emptyList(), true).isEmpty())
     }

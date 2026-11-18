@@ -19,6 +19,40 @@ import com.noki.vpn.vpn.awaitRuWireGuardReady
 @org.junit.runner.RunWith(org.robolectric.RobolectricTestRunner::class)
 @org.robolectric.annotation.Config(sdk = [28])
 class RuWireGuardContractTest {
+    @Test fun cachedIngressRequiresTheSameAuthoritativeWireGuardEndpoint() = runBlocking {
+        for (advertised in listOf("203.0.113.5:51820", "203.0.113.9:51820", null)) withCachedEntry { context, repository, settings, exit, entry ->
+            val pair = WireGuardKeyStore.android(context).getOrCreate()
+            val publicKey = pair.publicKeyBase64().also { pair.privateKey.fill(0) }
+            val cached = checkNotNull(repository.readRuEntry("account", settings.backendDeviceId, publicKey))
+            var enrollments = 0
+            val client = OkHttpClient.Builder().addInterceptor { chain ->
+                val request = chain.request()
+                val response = when (request.url.encodedPath) {
+                    "/v1/vpn/ru-relays" -> JSONObject().put("route_version", 1).put("entry_node_id", JSONObject.NULL)
+                        .put("exit_node_id", request.url.queryParameter("exit_node_id") ?: JSONObject.NULL)
+                        .put("foreign_nodes", org.json.JSONArray().put(JSONObject().put("id", exit).put("name", "Exit").put("country_code", "NL")))
+                        .put("relays", org.json.JSONArray().put(JSONObject().put("id", entry).put("name", "Entry").put("country_code", "RU")
+                            .put("available", true).put("pair_ready", true).put("wireguard_endpoint", advertised ?: JSONObject.NULL)))
+                    "/v1/devices/challenge" -> JSONObject().put("device_id", settings.backendDeviceId).put("nonce", "nonce-1234567890123456")
+                    "/v1/vpn/wireguard-keys" -> JSONObject().put("id", "55555555-5555-4555-8555-555555555555").put("public_key", publicKey)
+                    "/v1/vpn/ru-entry" -> JSONObject(cached.toString()).also {
+                        enrollments++
+                        it.getJSONObject("wireguard").put("endpoint", advertised ?: "203.0.113.9:51820")
+                    }
+                    else -> error("unexpected route")
+                }
+                Response.Builder().request(request).protocol(Protocol.HTTP_1_1).code(200).message("OK")
+                    .body(response.toString().toResponseBody("application/json".toMediaType())).build()
+            }.build()
+            val prepared = com.noki.vpn.vpn.RuWireGuardConnectionCoordinator(context, repository,
+                BackendApiClient(client, "https://api.example", challengeSigner = { "signature" }),
+                challengeSigner = { "signature" }).prepare(settings)
+            try {
+                assertEquals(if (advertised == "203.0.113.5:51820") 0 else 1, enrollments)
+                assertEquals(advertised ?: "203.0.113.9:51820", prepared.credential.wireguard.endpoint)
+            } finally { prepared.privateKey.fill(0) }
+        }
+    }
     @Test fun persistedEntryNeverBypassesFreshAutoEligibilityOnANewStart() = runBlocking {
         withCachedEntry { context, repository, settings, _, _ ->
             val client = OkHttpClient.Builder().addInterceptor { chain ->
@@ -52,7 +86,8 @@ class RuWireGuardContractTest {
                         .put("relays", org.json.JSONArray().put(JSONObject().put("id", fresh).put("name", "Fresh").put("country_code", "RU")
                             .put("available", true).put("pair_ready", true).put("probe_host", "fresh.example").put("probe_port", 25001))
                             .put(JSONObject().put("id", entry).put("name", "Cached").put("country_code", "RU").put("available", true)
-                                .put("pair_ready", true).put("probe_host", "old.example").put("probe_port", 25002)))
+                                .put("pair_ready", true).put("probe_host", "old.example").put("probe_port", 25002)
+                                .put("wireguard_endpoint", "203.0.113.5:51820")))
                     "/v1/devices/challenge" -> JSONObject().put("device_id", settings.backendDeviceId).put("nonce", "nonce-1234567890123456")
                     "/v1/vpn/wireguard-keys" -> JSONObject().put("id", "55555555-5555-4555-8555-555555555555").put("public_key", publicKey)
                     "/v1/vpn/ru-entry" -> {

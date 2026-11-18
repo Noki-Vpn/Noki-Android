@@ -135,7 +135,7 @@ internal class BackendSyncCoordinator(
             return locations.any { location ->
                 if (!location.isOnline) return@any false
                 if (location.servers.isNotEmpty()) return@any location.servers.any {
-                    it.isOnline && it.probePort != null && clientLatencyTargetKey(it) !in clientLatencyByTarget
+                    it.isOnline && (it.probePort != null || it.probeIp != null) && clientLatencyTargetKey(it) !in clientLatencyByTarget
                 }
                 val targetKey = clientLatencyTargetKey(location) ?: return@any false
                 !clientLatencyByTarget.containsKey(targetKey)

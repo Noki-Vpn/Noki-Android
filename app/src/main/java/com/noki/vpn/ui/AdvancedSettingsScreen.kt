@@ -76,7 +76,7 @@ fun AdvancedSettingsScreen(
             val context = LocalContext.current
             val language = state.personalizationSettings.language
             val autoEndpointSelection = state.advancedSettings.endpointSelectionMode == EndpointSelectionMode.AUTO
-            val alwaysOnCount = state.advancedSettings.alwaysOnDomains.count { it != DomainRulePolicy.RUSSIAN_RESOURCES_RULE }
+            val alwaysOnCount = state.advancedSettings.alwaysOnDomains.size
             val bypassCount = state.advancedSettings.bypassDomains.count { it != DomainRulePolicy.RUSSIAN_RESOURCES_RULE }
             var showProtocolSheet by rememberSaveable { mutableStateOf(false) }
             var showProtocolNotice by rememberSaveable { mutableStateOf(false) }
@@ -241,6 +241,8 @@ fun AdvancedSettingsScreen(
                 AdvancedDomainRuleWideCard(
                     title = tr(language, "Всегда включать", "Always on"),
                     count = alwaysOnCount,
+                    summary = if (state.advancedSettings.alwaysOnDomains.any { it.startsWith("geosite:") || it.startsWith("regexp:") })
+                        customRuleSummary(language, alwaysOnCount) else null,
                     detail = tr(language, "всегда с VPN", "always with VPN"),
                     language = language,
                     backdrop = surfaceBackdrop,
@@ -254,6 +256,8 @@ fun AdvancedSettingsScreen(
                 AdvancedDomainRuleWideCard(
                     title = tr(language, "Всегда выключать", "Always off"),
                     count = bypassCount,
+                    summary = bypassRuleSummary(language, bypassCount,
+                        DomainRulePolicy.RUSSIAN_RESOURCES_RULE in state.advancedSettings.bypassDomains),
                     detail = tr(language, "всегда без VPN", "always without VPN"),
                     language = language,
                     backdrop = surfaceBackdrop,

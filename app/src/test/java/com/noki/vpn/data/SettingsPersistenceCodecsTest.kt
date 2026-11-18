@@ -12,6 +12,63 @@ import org.junit.Assert.assertThrows
 import org.junit.Test
 
 class SettingsPersistenceCodecsTest {
+    @Test fun geositeUpgradePreservesEffectiveOnOnceAndTheFollowingOffWithoutResettingRu() {
+        val original = defaults.copy(ruRelaySelectionRevision = 17,
+            advancedSettings = defaults.advancedSettings.copy(ruRelayEnabled = false,
+                bypassDomains = listOf("domain:custom.example")))
+        var raw = org.json.JSONObject(settingsCodec.encode(original)).apply { remove("geositeRuleVersion") }.toString()
+        var migrations = 0
+        val migrated = settingsCodec.decode(raw) { migrations++; raw = settingsCodec.encode(it) }
+        assertEquals(1, migrations)
+        assertEquals(listOf("domain:custom.example", DomainRulePolicy.RUSSIAN_RESOURCES_RULE), migrated.advancedSettings.bypassDomains)
+        assertFalse(migrated.advancedSettings.ruRelayEnabled)
+        assertEquals(17L, migrated.ruRelaySelectionRevision)
+        assertEquals(1, org.json.JSONObject(raw).getInt("geositeRuleVersion"))
+        val disabled = migrated.copy(advancedSettings = migrated.advancedSettings.copy(bypassDomains = listOf("domain:custom.example")))
+        repeat(3) {
+            raw = settingsCodec.encode(disabled)
+            assertEquals(disabled, settingsCodec.decode(raw) { error("Saved OFF must survive restart") })
+        }
+        val enabled = disabled.copy(advancedSettings = DomainRulePolicy.addBypass(disabled.advancedSettings, DomainRulePolicy.RUSSIAN_RESOURCES_RULE))
+        assertEquals(enabled, settingsCodec.decode(settingsCodec.encode(enabled)))
+    }
+
+    @Test fun geositeMigrationRetainsAPositiveLegacyExplicitVpnChoice() {
+        val explicit = defaults.copy(advancedSettings = defaults.advancedSettings.copy(
+            alwaysOnDomains = listOf(DomainRulePolicy.RUSSIAN_RESOURCES_RULE), bypassDomains = emptyList()))
+        val raw = org.json.JSONObject(settingsCodec.encode(explicit)).apply { remove("geositeRuleVersion") }.toString()
+        val restored = settingsCodec.decode(raw)
+        assertEquals(explicit.advancedSettings.alwaysOnDomains, restored.advancedSettings.alwaysOnDomains)
+        assertTrue(restored.advancedSettings.bypassDomains.isEmpty())
+    }
+
+    @Test fun upgradeEnablesRuOnceEvenForAnExplicitFalseAndPreservesDisabledHopSelectors() {
+        val pair = MultiHopSettings(true, HopSelection(ServerSelectionMode.SERVER, nodeId = "entry"),
+            HopSelection(ServerSelectionMode.SERVER, nodeId = "exit"))
+        val original = defaults.copy(ruRelaySelectionRevision = 17,
+            isAuthenticated = true, backendAccessToken = "retained-access",
+            userProfile = defaults.userProfile.copy(selectedPlanTier = "plus"),
+            advancedSettings = defaults.advancedSettings.copy(ruRelayEnabled = false, multiHop = pair,
+                gamingModeEnabled = true, youtubeNoAdsEnabled = true))
+        var raw = org.json.JSONObject(settingsCodec.encode(original)).put("ruRelayDefaultsVersion", 3).toString()
+        val migrated = settingsCodec.decode(raw) { raw = settingsCodec.encode(it) }
+        assertTrue(migrated.advancedSettings.ruRelayEnabled)
+        assertFalse(migrated.advancedSettings.multiHop.enabled)
+        assertFalse(migrated.advancedSettings.gamingModeEnabled)
+        assertEquals(pair.copy(enabled = false), migrated.advancedSettings.multiHop)
+        assertTrue(migrated.advancedSettings.youtubeNoAdsEnabled)
+        assertEquals("retained-access", migrated.backendAccessToken)
+        assertEquals(18L, migrated.ruRelaySelectionRevision)
+        assertEquals(4, org.json.JSONObject(raw).getInt("ruRelayDefaultsVersion"))
+        val disabled = migrated.copy(advancedSettings = migrated.advancedSettings.copy(ruRelayEnabled = false))
+        val saved = settingsCodec.encode(disabled)
+        repeat(3) { assertEquals(disabled, settingsCodec.decode(saved) { error("Already migrated user choice must not reset") }) }
+    }
+
+    @Test fun freshReleaseDefaultsToRuRelay() {
+        assertTrue(DefaultStoredSettingsFactory.create(isFreshInstall = true).advancedSettings.ruRelayEnabled)
+        assertTrue(settingsCodec.decode(null).advancedSettings.ruRelayEnabled)
+    }
     private val defaults = DefaultStoredSettingsFactory.create(Locale.US)
     private val settingsCodec = StoredSettingsCodec { defaults }
 
@@ -140,8 +197,8 @@ class SettingsPersistenceCodecsTest {
         val disabled = settings.copy(advancedSettings = settings.advancedSettings.copy(ruRelayEnabled = false))
         assertFalse(settingsCodec.decode(settingsCodec.encode(disabled)).advancedSettings.ruRelayEnabled)
         val damaged = settingsCodec.decode("""{"protocol":"WIREGUARD","ruRelayEnabled":false,"ruRelayDefaultsVersion":1}""")
-        assertFalse(damaged.advancedSettings.ruRelayEnabled)
-        assertEquals(VpnProtocol.AUTO, damaged.advancedSettings.effectiveProtocol)
+        assertTrue(damaged.advancedSettings.ruRelayEnabled)
+        assertEquals(VpnProtocol.WIREGUARD, damaged.advancedSettings.effectiveProtocol)
     }
 
     @Test
@@ -157,7 +214,7 @@ class SettingsPersistenceCodecsTest {
     }
 
     @Test
-    fun `release upgrade disables RU relay once without resetting account or routing preferences`() {
+    fun `release upgrade enables RU relay once without resetting account or routing preferences`() {
         val saved = defaults.copy(
             userProfile = defaults.userProfile.copy(selectedPlanTier = "plus"),
             isAuthenticated = true, backendAccessToken = "access", backendRefreshToken = "refresh",
@@ -165,7 +222,7 @@ class SettingsPersistenceCodecsTest {
             profile = defaults.profile.copy(endpointCode = "direct-tls", host = "vpn.example.test",
                 security = "tls", uuid = "22222222-2222-4222-8222-222222222222"),
             selectedPackages = setOf("example.app"),
-            advancedSettings = defaults.advancedSettings.copy(ruRelayEnabled = true,
+            advancedSettings = defaults.advancedSettings.copy(ruRelayEnabled = false,
                 protocol = VpnProtocol.REALITY, endpointSelectionMode = EndpointSelectionMode.MANUAL,
                 youtubeNoAdsEnabled = true,
                 bypassDomains = listOf("domain:example.test")),
@@ -175,20 +232,18 @@ class SettingsPersistenceCodecsTest {
         }.toString()
         val migrated = settingsCodec.decode(legacy)
         val expected = saved.copy(
-            advancedSettings = saved.advancedSettings.copy(ruRelayEnabled = false),
+            advancedSettings = saved.advancedSettings.copy(ruRelayEnabled = true),
             profile = RuntimeProfilePolicy.profileAfterServerSelection(saved.profile),
             ruRelaySelectionRevision = 18L,
         )
 
         assertEquals(expected, migrated)
         val persisted = settingsCodec.encode(migrated)
-        assertEquals(3, org.json.JSONObject(persisted).getInt("ruRelayDefaultsVersion"))
+        assertEquals(4, org.json.JSONObject(persisted).getInt("ruRelayDefaultsVersion"))
         assertEquals(migrated, settingsCodec.decode(persisted))
 
-        val enabled = migrated.copy(advancedSettings = migrated.advancedSettings.copy(ruRelayEnabled = true))
-        assertEquals(enabled, settingsCodec.decode(settingsCodec.encode(enabled)))
-        assertEquals(enabled, settingsCodec.decode(org.json.JSONObject(settingsCodec.encode(enabled))
-            .put("ruRelayDefaultsVersion", 3).toString()))
+        val disabled = migrated.copy(advancedSettings = migrated.advancedSettings.copy(ruRelayEnabled = false))
+        assertEquals(disabled, settingsCodec.decode(settingsCodec.encode(disabled)))
         assertEquals(expected, settingsCodec.decode(org.json.JSONObject(legacy)
             .put("ruRelayDefaultsVersion", 1).toString()))
         var stored = legacy
@@ -209,7 +264,7 @@ class SettingsPersistenceCodecsTest {
         assertEquals(advanced, restored.advancedSettings)
         assertEquals(VpnProtocol.NOKINV, restored.advancedSettings.effectiveProtocol)
         assertEquals(VpnProtocol.REALITY, restored.advancedSettings.copy(gamingModeEnabled = false).effectiveProtocol)
-        assertFalse(settingsCodec.decode(null).advancedSettings.ruRelayEnabled)
+        assertTrue(settingsCodec.decode(null).advancedSettings.ruRelayEnabled)
         assertFalse(settingsCodec.decode(null).advancedSettings.gamingModeEnabled)
     }
 
@@ -219,10 +274,10 @@ class SettingsPersistenceCodecsTest {
             "entry":{"kind":"COUNTRY","countryCode":"RU"},
             "exit":{"kind":"SERVER","nodeId":"node-b"}}}""")
         assertEquals(BuildConfig.RU_RELAY_DEFAULT_ENABLED, restored.advancedSettings.ruRelayEnabled)
-        assertTrue(restored.advancedSettings.multiHop.enabled)
+        assertFalse(restored.advancedSettings.multiHop.enabled)
         assertNull(restored.advancedSettings.multiHop.entry)
         assertEquals("node-b", restored.advancedSettings.multiHop.exit?.nodeId)
-        assertTrue(runCatching { restored.advancedSettings.multiHop.explicitNodeIds() }.isFailure)
+        assertNull(restored.advancedSettings.multiHop.explicitNodeIds())
         assertEquals(BuildConfig.RU_RELAY_DEFAULT_ENABLED,
             settingsCodec.decode("""{"multiHopSettings":{"enabled":false}}""")
                 .advancedSettings.ruRelayEnabled)
@@ -454,7 +509,7 @@ class SettingsPersistenceCodecsTest {
         assertEquals("owner", decoded.backendDeviceAccessRole)
         assertEquals(AppFilterMode.ALL_APPS, decoded.filterMode)
         assertTrue(decoded.selectedPackages.isEmpty())
-        assertTrue(decoded.advancedSettings.bypassDomains.isEmpty())
+        assertEquals(listOf(DomainRulePolicy.RUSSIAN_RESOURCES_RULE), decoded.advancedSettings.bypassDomains)
     }
 
     @Test

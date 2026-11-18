@@ -14,6 +14,7 @@ data class RuRelayCatalogEntry(
     val selectionWeight: Int = 1,
     val metricsAt: String? = null,
     val probeIp: String? = null,
+    val wireguardEndpoint: String? = null,
 )
 
 /** Eligible physical overlay participants; no location or proxy listener is invented. */
@@ -66,7 +67,7 @@ object RuRelayCatalogJsonParser {
             val probePort = item.optInt("probe_port", 0).takeIf { probeHost != null && it in 1..65535 }
             RuRelayCatalogEntry(id, name, countryCode, available, unavailableReason, probeHost, probePort, pairReady,
                 item.selectionWeight(), item.optBackendString("metrics_at"),
-                item.optBackendString("probe_ip")?.takeIf { available && pairReady })
+                item.optBackendString("probe_ip")?.takeIf { available && pairReady }, item.optBackendString("wireguard_endpoint"))
         }
         require(relays.map { it.id }.toSet().size == relays.size) { "ru_relay_catalog_duplicate" }
         require(exitNodeId != null || json.optJSONArray("foreign_nodes") != null) { "ru_foreign_nodes_missing" }

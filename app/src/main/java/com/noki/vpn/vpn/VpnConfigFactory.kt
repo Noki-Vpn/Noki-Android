@@ -92,18 +92,20 @@ object VpnConfigFactory {
                               mtu: Int, address: String, dnsServers: List<String>,
                               youtubeConnection: YoutubeConnectionConfig?, endpoints: JSONArray = JSONArray()): JSONObject {
         val normalized = DomainRulePolicy.normalizeSettings(settings)
-        val selectors = (normalized.alwaysOnDomains + normalized.bypassDomains + DomainRulePolicy.RUSSIAN_RESOURCES_RULE +
+        val selectors = (normalized.alwaysOnDomains + normalized.bypassDomains +
             if (normalized.youtubeNoAdsEnabled) listOf(YOUTUBE_RULE) else emptyList())
             .filter { it.startsWith("geosite:") }.toSet()
         val resolved = GeositeAsset.resolveDomains(geodata.geosite, selectors)
-        val russian = domainMatch(listOf(DomainRulePolicy.RUSSIAN_RESOURCES_RULE), resolved)
-            ?: throw IllegalArgumentException("geosite_category_ru_empty")
+        val russian = if (DomainRulePolicy.RUSSIAN_RESOURCES_RULE in normalized.bypassDomains) {
+            domainMatch(listOf(DomainRulePolicy.RUSSIAN_RESOURCES_RULE), resolved)
+                ?: throw IllegalArgumentException("geosite_category_ru_empty")
+        } else null
         val rules = JSONArray()
         rules.put(JSONObject().put("inbound", JSONArray().put("tun"))
             .put("action", "sniff").put("sniffer", JSONArray().put("http").put("tls")
                 .apply { if (normalized.youtubeNoAdsEnabled) put("quic") }))
         rules.put(JSONObject().put("port", JSONArray().put(53)).put("action", "hijack-dns"))
-        rules.put(route(JSONObject(russian.toString()), "direct"))
+        russian?.let { rules.put(route(JSONObject(it.toString()), "direct")) }
         rules.put(route(JSONObject().put("ip_cidr", JSONArray(geodata.russianCidrs)), "direct"))
         rules
             .put(JSONObject().put("port", JSONArray().put(853)).put("network", JSONArray().put("tcp").put("udp"))
@@ -114,7 +116,7 @@ object VpnConfigFactory {
                 .put(JSONObject().put("network", JSONArray().put("tcp")))).put("action", "reject"))
             .put(route(JSONObject().put("ip_cidr", JSONArray(privateCidrs)), "direct"))
         val dnsRules = JSONArray()
-        dnsRules.put(JSONObject(russian.toString()).put("server", BOOTSTRAP_TAG))
+        russian?.let { dnsRules.put(JSONObject(it.toString()).put("server", BOOTSTRAP_TAG)) }
         if (normalized.youtubeNoAdsEnabled) {
             val youtube = domainMatch(listOf(YOUTUBE_RULE), resolved)
                 ?: throw IllegalArgumentException("geosite_youtube_empty")
@@ -130,7 +132,7 @@ object VpnConfigFactory {
         // DNS follows the same exclusions as data; a failed underlay lookup never falls back to node DNS.
         // YouTube's explicit DNS rule stays ahead of overlapping user exclusions.
         for (match in listOfNotNull(JSONObject().put("domain_suffix", JSONArray().put("googleapis.cn")),
-            domainMatch(normalized.bypassDomains, resolved))) {
+            domainMatch(normalized.bypassDomains.filterNot { it == DomainRulePolicy.RUSSIAN_RESOURCES_RULE }, resolved))) {
             rules.put(route(JSONObject(match.toString()), "direct"))
             dnsRules.put(JSONObject(match.toString()).put("server", BOOTSTRAP_TAG))
         }

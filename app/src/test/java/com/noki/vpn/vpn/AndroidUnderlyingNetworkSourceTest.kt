@@ -12,6 +12,49 @@ import org.robolectric.Shadows.shadowOf
 @RunWith(RobolectricTestRunner::class)
 @Config(sdk = [35])
 class AndroidUnderlyingNetworkSourceTest {
+    @Test fun foreignNodeIcmpUsesThePhysicalWifiInterfaceInsteadOfTheActiveVpn() = kotlinx.coroutines.runBlocking {
+        val context = org.robolectric.RuntimeEnvironment.getApplication()
+        val manager = context.getSystemService(android.content.Context.CONNECTIVITY_SERVICE) as android.net.ConnectivityManager
+        val shadow = shadowOf(manager)
+        shadow.clearAllNetworks()
+        fun network(id: Int, type: Int, transport: Int, name: String): android.net.Network {
+            val network = org.robolectric.shadows.ShadowNetwork.newInstance(id)
+            val info = org.robolectric.shadows.ShadowNetworkInfo.newInstance(android.net.NetworkInfo.DetailedState.CONNECTED,
+                type, 0, true, true)
+            val caps = org.robolectric.util.ReflectionHelpers.callConstructor(android.net.NetworkCapabilities::class.java).apply {
+                javaClass.getDeclaredMethod("addTransportType", Int::class.javaPrimitiveType).invoke(this, transport)
+                for (capability in listOf(android.net.NetworkCapabilities.NET_CAPABILITY_INTERNET,
+                    android.net.NetworkCapabilities.NET_CAPABILITY_VALIDATED,
+                    android.net.NetworkCapabilities.NET_CAPABILITY_NOT_SUSPENDED)) {
+                    javaClass.getDeclaredMethod("addCapability", Int::class.javaPrimitiveType).invoke(this, capability)
+                }
+                javaClass.getDeclaredMethod(if (transport != android.net.NetworkCapabilities.TRANSPORT_VPN) "addCapability" else "removeCapability",
+                    Int::class.javaPrimitiveType).invoke(this, android.net.NetworkCapabilities.NET_CAPABILITY_NOT_VPN)
+            }
+            shadow.addNetwork(network, info)
+            shadow.setNetworkCapabilities(network, caps)
+            shadow.setLinkProperties(network, android.net.LinkProperties().apply { interfaceName = name })
+            shadow.setActiveNetworkInfo(info)
+            return network
+        }
+        val wifi = network(101, android.net.ConnectivityManager.TYPE_WIFI, android.net.NetworkCapabilities.TRANSPORT_WIFI, "wlan0")
+        network(102, android.net.ConnectivityManager.TYPE_VPN, android.net.NetworkCapabilities.TRANSPORT_VPN, "tun9")
+        assertEquals(wifi, AndroidUnderlyingNetworkSource(context).currentSnapshot()?.network)
+        val calls = java.util.concurrent.CopyOnWriteArrayList<Pair<String, String>>()
+        val sampler = com.noki.vpn.data.ClientLatencySampler(context = context, boundIcmpPing = { ip, name ->
+            calls += ip to name
+            if (ip.endsWith(".1")) 21 else 48
+        })
+        val nodes = listOf(com.noki.vpn.data.RuForeignNode("one", "FR", "FR", probeIp = "203.0.113.1"),
+            com.noki.vpn.data.RuForeignNode("two", "NL", "NL", probeIp = "203.0.113.2"))
+        assertEquals(mapOf("one" to 21, "two" to 48), sampler.measureNodes(nodes,
+            { it.id }, { it.probeHost }, { it.probePort }, { it.probeIp }))
+        assertEquals(setOf("203.0.113.1" to "wlan0", "203.0.113.2" to "wlan0"), calls.toSet())
+        shadow.removeNetwork(wifi)
+        assertEquals(emptyMap<String, Int>(), sampler.measureNodes(nodes,
+            { it.id }, { it.probeHost }, { it.probePort }, { it.probeIp }))
+        assertEquals(2, calls.size)
+    }
     @Test
     fun `connection signature tracks addresses and routes but ignores DNS and their ordering`() {
         val network = org.robolectric.shadows.ShadowNetwork.newInstance(101)

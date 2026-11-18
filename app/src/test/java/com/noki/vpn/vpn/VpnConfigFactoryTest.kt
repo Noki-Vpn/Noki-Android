@@ -157,9 +157,9 @@ class VpnConfigFactoryTest {
                     assertYoutubeRoute(config)
                     assertYoutubeTransport(config)
                     val dnsRules = config.getJSONObject("dns").getJSONArray("rules")
-                    assertEquals("noki-node-dns", dnsRules.getJSONObject(1).getString("server"))
-                    assertEquals("bootstrap", (2 until dnsRules.length()).map(dnsRules::getJSONObject)
-                        .single { it.toString().contains("googlevideo.com") }.getString("server"))
+                    val matches = (0 until dnsRules.length()).map(dnsRules::getJSONObject)
+                        .filter { it.toString().contains("googlevideo.com") }
+                    assertEquals(listOf("noki-node-dns", "bootstrap"), matches.map { it.getString("server") })
                 }
                 val outbound = config.getJSONArray("outbounds").getJSONObject(0)
                 assertFalse(outbound.has("ip_tunnel"))
@@ -283,21 +283,46 @@ class VpnConfigFactoryTest {
     }
 
     @Test
-    fun russianDirectAndDnsStayDirectWhenThePresetIsAbsentFromSavedSettings() {
+    fun disabledGeositeLeavesExplicitUserVpnAndIndependentRussianGeoIpPolicy() {
         val config = JSONObject(VpnConfigFactory.build(profile(), AdvancedSettings(
             alwaysOnDomains = listOf("domain:russian.example", DomainRulePolicy.RUSSIAN_RESOURCES_RULE),
             bypassDomains = listOf("domain:local.example"),
         ), geosite))
         val rules = rules(config)
         val russian = rules.indexOfFirst { it.optJSONArray("domain_suffix")?.toString() == "[\"russian.example\"]" && it.optString("outbound") == "direct" }
-        val vpn = rules.indexOfFirst { it.optString("outbound") == "proxy" }
-        assertTrue(russian >= 0 && russian < vpn)
-        assertTrue(config.getJSONObject("dns").getJSONArray("rules").toString().contains("russian.example"))
+        assertEquals(-1, russian)
+        assertTrue(rules.any { it.optString("outbound") == "proxy" && it.toString().contains("russian.example") })
+        assertFalse(config.getJSONObject("dns").getJSONArray("rules").toString().contains("russian.example"))
         assertTrue(rules.any { it.optJSONArray("ip_cidr")?.toString()?.contains("5.8.0.0/16") == true &&
             it.optString("outbound") == "direct" })
         assertEquals("proxy", config.getJSONObject("route").getString("final"))
         assertTrue(rules.any { it.optJSONArray("domain_suffix")?.toString() == "[\"local.example\"]" && it.optString("outbound") == "direct" })
         assertFalse(config.toString().contains("geosite:"))
+    }
+
+    @Test fun geositeOnOffControlsOnlyItsDomainAndDnsRulesOnOrdinaryAndRuWithYoutube() {
+        val wg = BackendRuWireGuardConfig("203.0.113.10:51820",
+            java.util.Base64.getEncoder().encodeToString(ByteArray(32) { 2 }),
+            "10.240.1.2/32", listOf("1.1.1.1"), 1280, listOf("0.0.0.0/0"))
+        for (enabled in listOf(true, false)) for (youtube in listOf(true, false)) {
+            val settings = AdvancedSettings(youtubeNoAdsEnabled = youtube,
+                bypassDomains = listOf("domain:custom.example") +
+                    if (enabled) listOf(DomainRulePolicy.RUSSIAN_RESOURCES_RULE) else emptyList())
+            val secondary = if (youtube) youtubeRemote() else null
+            val configs = primaryProfiles().map { JSONObject(VpnConfigFactory.build(it, settings, geosite, secondary)) } +
+                JSONObject(VpnConfigFactory.buildWireGuard(wg, ByteArray(32) { 1 },
+                    settings.copy(ruRelayEnabled = true), geosite, secondary))
+            for (config in configs) {
+                val directRu = rules(config).filter { it.optString("outbound") == "direct" && it.toString().contains("russian.example") }
+                assertEquals(if (enabled) 1 else 0, directRu.size)
+                val dns = config.getJSONObject("dns").getJSONArray("rules")
+                assertEquals(enabled, (0 until dns.length()).map(dns::getJSONObject).any {
+                    it.optString("server") == "bootstrap" && it.toString().contains("russian.example") })
+                assertTrue(rules(config).any { it.optString("outbound") == "direct" && it.toString().contains("5.8.0.0/16") })
+                assertTrue(rules(config).any { it.optString("outbound") == "direct" && it.toString().contains("custom.example") })
+                if (youtube) { assertYoutubeRoute(config); assertYoutubeTransport(config) }
+            }
+        }
     }
 
     @Test
@@ -343,7 +368,7 @@ class VpnConfigFactoryTest {
         val settings = AdvancedSettings(
             alwaysOnDomains = listOf("full:protected.example"),
             bypassDomains = listOf("domain:local.example", "full:exact.example", "regexp:^corp[.]",
-                "geosite:sample", "full:protected.example"),
+                "geosite:sample", "full:protected.example", DomainRulePolicy.RUSSIAN_RESOURCES_RULE),
         )
         val nokinv = VlessProfile(proxyType = "nokinv", transport = "nokinv", transportMode = "quic",
             security = "tls", host = "node.example", port = "10443", serverName = "node.example",
@@ -394,10 +419,12 @@ class VpnConfigFactoryTest {
             youtubeNoAdsEnabled = true, bypassDomains = listOf("geosite:youtube"),
         ), geosite, youtubeRemote()))
         val dnsRules = config.getJSONObject("dns").getJSONArray("rules")
-        val protected = dnsRules.getJSONObject(1)
+        val matches = (0 until dnsRules.length()).map(dnsRules::getJSONObject)
+            .filter { it.toString().contains("googlevideo.com") }
+        assertEquals(2, matches.size)
+        val protected = matches.first()
         assertEquals("noki-node-dns", protected.getString("server"))
-        val direct = (2 until dnsRules.length()).map(dnsRules::getJSONObject)
-            .single { it.toString().contains("googlevideo.com") }
+        val direct = matches.last()
         assertEquals("bootstrap", direct.getString("server"))
         val protectedMatch = JSONObject(protected.toString()).apply { remove("server") }
         val directMatch = JSONObject(direct.toString()).apply { remove("server") }

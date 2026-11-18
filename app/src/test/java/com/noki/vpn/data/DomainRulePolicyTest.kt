@@ -6,6 +6,16 @@ import org.junit.Assert.assertTrue
 import org.junit.Test
 
 class DomainRulePolicyTest {
+    @Test fun russianPresetUsesTheSameSavedListOwnerAsOtherRules() {
+        val preset = DomainRulePolicy.RUSSIAN_RESOURCES_RULE
+        val enabled = DomainRulePolicy.addBypass(AdvancedSettings(alwaysOnDomains = listOf(preset)), preset)
+        assertEquals(listOf(preset), enabled.bypassDomains)
+        assertTrue(enabled.alwaysOnDomains.isEmpty())
+        val explicitVpn = DomainRulePolicy.addAlways(enabled, preset)
+        assertEquals(listOf(preset), explicitVpn.alwaysOnDomains)
+        assertTrue(explicitVpn.bypassDomains.isEmpty())
+    }
+
     @Test
     fun geositeGrammarKeepsPositiveAttributeConjunctionAndRejectsNewSyntax() {
         assertEquals("geosite:category-ru@cn@ads", DomainRulePolicy.normalize(" GEOSITE:Category-RU@CN@ads "))

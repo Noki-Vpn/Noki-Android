@@ -185,6 +185,7 @@ internal fun AdvancedDomainRuleWideCard(
     backdrop: PrismalGlassLayer?,
     liveGlassEnabled: Boolean,
     modifier: Modifier,
+    summary: String? = null,
     onConfigure: () -> Unit,
 ) {
     val metrics = nokiAdaptiveMetrics(LocalConfiguration.current.screenWidthDp.dp)
@@ -216,7 +217,14 @@ internal fun AdvancedDomainRuleWideCard(
                     maxLines = 2,
                     modifier = Modifier.fillMaxWidth(),
                 )
-                Row(
+                if (summary != null) AdvancedText(
+                    text = summary,
+                    fontSize = 13f,
+                    lineHeight = 14f,
+                    color = AdvancedTextPrimary,
+                    maxLines = 2,
+                    modifier = Modifier.fillMaxWidth(),
+                ) else Row(
                     modifier = Modifier.fillMaxWidth(),
                     horizontalArrangement = Arrangement.spacedBy(metrics.dp(4f)),
                     verticalAlignment = Alignment.Bottom,
@@ -265,3 +273,14 @@ internal fun domainLabel(language: AppLanguage, count: Int): String {
         else -> "доменов"
     }
 }
+
+internal fun bypassRuleSummary(language: AppLanguage, count: Int, builtInEnabled: Boolean): String {
+    val custom = customRuleSummary(language, count)
+    return if (builtInEnabled) {
+        val builtIn = tr(language, "Встроенный geosite", "Built-in geosite")
+        if (count == 0) builtIn else "$builtIn\n$custom"
+    } else if (count == 0) tr(language, "Нет активных правил", "No active rules") else custom
+}
+
+internal fun customRuleSummary(language: AppLanguage, count: Int): String =
+    tr(language, "Правила пользователя: $count", "Custom rules: $count")

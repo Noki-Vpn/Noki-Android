@@ -9,16 +9,27 @@ internal class StoredSettingsCodec(
     fun decode(raw: String?, persistMigration: ((StoredSettings) -> Unit)? = null): StoredSettings {
         if (raw.isNullOrBlank()) return defaults()
         val json = runCatching { JSONObject(raw) }.getOrElse { return defaults() }
-        val resetLegacyRuDefault = json.optInt("ruRelayDefaultsVersion") < 3
+        val migrateRuDefault = json.optInt("ruRelayDefaultsVersion") < 4
+        val migrateGeositeRule = json.optInt("geositeRuleVersion") < 1
         var routeSelectionMigrated = false
         val migrated = runCatching {
             val decoded = decode(json).let { settings ->
-                val explicitConflict = json.optBoolean("ruRelayEnabled") && settings.advancedSettings.multiHop.enabled
-                if (!resetLegacyRuDefault || explicitConflict) settings else settings.copy(
-                    advancedSettings = settings.advancedSettings.copy(ruRelayEnabled = false),
+                if (!migrateRuDefault) settings else settings.copy(
+                    advancedSettings = RuntimeProfilePolicy.normalizeRouteModes(settings.advancedSettings.copy(
+                        ruRelayEnabled = true, gamingModeEnabled = false)),
                     profile = RuntimeProfilePolicy.profileAfterServerSelection(settings.profile),
+                    endpointOptions = emptyList(),
                     ruRelaySelectionRevision = settings.ruRelaySelectionRevision + 1L,
                 )
+            }.let { settings ->
+                val advanced = settings.advancedSettings
+                val explicitLegacyVpn = DomainRulePolicy.RUSSIAN_RESOURCES_RULE in advanced.alwaysOnDomains &&
+                    DomainRulePolicy.RUSSIAN_RESOURCES_RULE !in advanced.bypassDomains
+                // Older payloads cannot distinguish a removed preset from the
+                // releases that forced it on. Preserve effective ON once, unless
+                // an explicit opposite rule positively records the user's choice.
+                if (!migrateGeositeRule || explicitLegacyVpn) settings else settings.copy(
+                    advancedSettings = DomainRulePolicy.addBypass(advanced, DomainRulePolicy.RUSSIAN_RESOURCES_RULE))
             }
             val selected = RuntimeProfilePolicy.normalizeRouteSelection(decoded)
             routeSelectionMigrated = selected != decoded
@@ -30,7 +41,7 @@ internal class StoredSettingsCodec(
                 stored.selectedPackages, stored.filterMode,
             ))
         }.getOrElse { return defaults() }
-        if (resetLegacyRuDefault || routeSelectionMigrated) persistMigration?.invoke(migrated)
+        if (migrateRuDefault || migrateGeositeRule || routeSelectionMigrated) persistMigration?.invoke(migrated)
         return migrated
     }
 
@@ -38,7 +49,8 @@ internal class StoredSettingsCodec(
 
     private fun encodeNormalized(settings: StoredSettings): String = JSONObject()
         .put("russianDirectDefaultsVersion", 1)
-        .put("ruRelayDefaultsVersion", 3)
+        .put("ruRelayDefaultsVersion", 4)
+        .put("geositeRuleVersion", 1)
         .put("remark", settings.profile.remark)
         .put("endpointCode", settings.profile.endpointCode)
         .put("proxyType", settings.profile.proxyType)

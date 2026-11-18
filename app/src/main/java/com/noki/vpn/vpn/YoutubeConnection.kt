@@ -96,6 +96,7 @@ internal class YoutubeConnection(
             var requestId = UUID.randomUUID().toString()
             var transientFailures = 0
             var selectionSamples: List<RuRelayRttSample>? = null
+            var identityRecreations = 0
             while (currentCoroutineContext().isActive && owner == sequence) {
                 try {
                     val settings = repository.load()
@@ -156,6 +157,32 @@ internal class YoutubeConnection(
                 } catch (cancelled: CancellationException) {
                     throw cancelled
                 } catch (error: Exception) {
+                    if (error is BackendException && error.statusCode == 409 &&
+                        error.message == "youtube_wireguard_identity_changed" && grant != null) {
+                        publish(owner, null)
+                        if (identityRecreations >= 2) {
+                            repository.recordAppLog("vpn", level = "error", message = "youtube_endpoint_changed_limit",
+                                errorType = "youtube_wireguard_identity_changed")
+                            awaitCancellation()
+                        }
+                        val previous = checkNotNull(grant)
+                        val revoked = withTimeoutOrNull(6_000) {
+                            try { api().revokeYoutubeAccess(previous.grantId, previous.revokeToken); true }
+                            catch (cancelled: CancellationException) { throw cancelled }
+                            catch (failed: BackendException) { failed.statusCode == 404 }
+                            catch (_: Exception) { false }
+                        } == true
+                        if (!revoked) {
+                            repository.recordAppLog("vpn", level = "error", message = "youtube_endpoint_change_revoke_failed",
+                                errorType = "youtube_wireguard_identity_changed")
+                            awaitCancellation()
+                        }
+                        identityRecreations++
+                        grant = null
+                        selectionSamples = null
+                        requestId = UUID.randomUUID().toString()
+                        continue
+                    }
                     if (!BackendRetryPolicy.isTransient(error)) {
                         publish(owner, null)
                         repository.recordAppLog("vpn", level = "error", message = "youtube_access_blocked",

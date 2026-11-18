@@ -37,7 +37,7 @@ val nokiBackendProbeHealthUrl = providers.gradleProperty("noki.backendProbeHealt
     .orElse("$nokiApiBaseUrl/v1/vpn/connectivity")
     .get()
 val ruRelayDefaultEnabled = providers.gradleProperty("noki.ruRelayDefaultEnabled")
-    .orElse("false")
+    .orElse("true")
     .get()
     .also { require(it == "true" || it == "false") { "noki.ruRelayDefaultEnabled must be true or false" } }
 val googleWebClientId = providers.gradleProperty("noki.googleWebClientId")
@@ -53,8 +53,8 @@ val geoipLicenseFile = layout.projectDirectory.file("src/main/assets/licenses/ge
 val prismalAarFile = layout.projectDirectory.file("libs/prismal-1.0.3.aar")
 val prismalAarSha256 = "40D5EAFC3B68554E0D5E159EA02ECDA8CA86EB32A43DC1B3BAE5C65344C08C2A"
 val supportedAbis = listOf("arm64-v8a", "armeabi-v7a", "x86_64")
-val expectedReleaseVersionCode = 328
-val expectedReleaseVersionName = "2.3.12"
+val expectedReleaseVersionCode = 330
+val expectedReleaseVersionName = "2.3.14"
 
 fun String.toBuildConfigString(): String =
     "\"${replace("\\", "\\\\").replace("\"", "\\\"")}\""

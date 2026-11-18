@@ -12,12 +12,6 @@ import kotlinx.coroutines.Job
 import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
-import kotlinx.coroutines.async
-import kotlinx.coroutines.awaitAll
-import kotlinx.coroutines.coroutineScope
-import kotlinx.coroutines.sync.Semaphore
-import kotlinx.coroutines.sync.withPermit
-import kotlinx.coroutines.withTimeoutOrNull
 
 internal fun AppUiRuntime.applyAndPersist(newState: AppUiState) {
     applyAndPersist(newState, SettingsEffect.None)
@@ -290,7 +284,7 @@ internal fun clientLatencyRequestTarget(
     foreignNodes: List<RuForeignNode> = emptyList(),
 ): List<String> {
     if (ruRelayEnabled) {
-        return foreignNodes.map { "ru:1:${it.id}" }.distinct().sorted()
+        return foreignNodes.map(::clientLatencyTargetKey).distinct().sorted()
     }
     return locations
         .asSequence()
@@ -322,7 +316,7 @@ internal fun AppUiRuntime.refreshClientLatenciesAsync(
     if (activeJob != null) {
         val sameNetwork = clientLatencyRefreshNetworkSignature == networkSignature
         if (clientLatencyRefreshTarget == target && sameNetwork && !refreshCached) return
-        if (!sameNetwork) {
+        if (!sameNetwork || clientLatencyRefreshTarget != target || refreshCached) {
             clientLatencyByTarget = emptyMap()
             uiState = BackendSyncCoordinator.withCachedClientLatencies(uiState, emptyMap())
         }
@@ -399,37 +393,6 @@ internal suspend fun AppUiRuntime.measureClientLatencies(
     foreignNodes: List<RuForeignNode> = uiState.ruForeignNodes,
 ): Map<String, Int> {
     if (!ruRelayEnabled) return clientLatencySampler.measure(locations)
-    val attempt = authSessionCoordinator.attempt() ?: return emptyMap()
-    val network = com.noki.vpn.vpn.AndroidUnderlyingNetworkSource(application)
-        .currentSnapshot()?.network ?: return emptyMap()
-    val probeApi = backendApi.onNetwork(network)
-    val deviceId = backendDeviceId
-    val deviceKey = backendDeviceKey
-    val targets = coroutineScope {
-        val slots = Semaphore(4)
-        foreignNodes.distinctBy { it.id }.map { server ->
-                async {
-                    val key = clientLatencyTargetKey(server)
-                    val relays = withTimeoutOrNull(8_000L) {
-                        slots.withPermit {
-                            try {
-                                authSessionCoordinator.run(attempt) { token ->
-                                    probeApi.ruRelayCatalog(token, deviceId, deviceKey, server.id, routeVersion = 1)
-                                }.relays
-                            } catch (cancelled: CancellationException) {
-                                throw cancelled
-                            } catch (_: Exception) {
-                                emptyList()
-                            }
-                        }
-                    }.orEmpty()
-                    key to relays.filter { it.available && it.pairReady }.mapNotNull { relay ->
-                        val host = relay.probeHost ?: return@mapNotNull null
-                        val port = relay.probePort ?: return@mapNotNull null
-                        host to port
-                    }
-                }
-            }.awaitAll().filterNotNull().toMap()
-    }
-    return clientLatencySampler.measureRelayTargets(targets)
+    return clientLatencySampler.measureNodes(foreignNodes, ::clientLatencyTargetKey,
+        { it.probeHost }, { it.probePort }, { it.probeIp })
 }

@@ -81,24 +81,20 @@ class ClientLatencySamplerTest {
     }
 
     @Test
-    fun relayPingUsesOnlyFullRelayPathsAndNeverFallsBackToDirectOrIcmp() = runBlocking {
-        val node = RuForeignNode("node", "Overlay", "LV")
-        val key = clientLatencyTargetKey(node)
-        val probes = mutableListOf<String>()
+    fun foreignNodePingNeverInventsPortsOrFallsBackToUnboundIcmp() = runBlocking {
+        val nodes = listOf(RuForeignNode("node", "Overlay", "LV", probeHost = "unreachable", probePort = 30001),
+            RuForeignNode("wg", "WG", "NL", probeIp = "203.0.113.8"))
+        val probes = java.util.concurrent.CopyOnWriteArrayList<String>()
         val sampler = ClientLatencySampler(
             tcpConnect = { host, port, _ ->
                 synchronized(probes) { probes += "$host:$port" }
-                when (host) { "relay1" -> 80; "relay2" -> 45; else -> null }
+                null
             },
-            icmpPing = { _, _, _ -> error("Relay ping must not degrade to relay-only ICMP") },
+            icmpPing = { _, _, _ -> error("A node probe must never fall back to an unbound process") },
+            tcpAttempts = 1,
         )
-        assertEquals(mapOf(key to 45), sampler.measureRelayTargets(
-            mapOf(key to listOf("relay1" to 30001, "relay2" to 30001))))
-        assertEquals(setOf("relay1:30001", "relay2:30001"), probes.toSet())
-        probes.clear()
-        assertTrue(sampler.measureRelayTargets(emptyMap()).isEmpty())
-        assertTrue(probes.isEmpty())
-        assertTrue(sampler.measureRelayTargets(mapOf(key to listOf("unreachable" to 30001))).isEmpty())
+        assertTrue(sampler.measureNodes(nodes, { it.id }, { it.probeHost }, { it.probePort }, { it.probeIp }).isEmpty())
+        assertEquals(listOf("unreachable:30001"), probes)
     }
 
     @Test

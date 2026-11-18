@@ -118,7 +118,8 @@ internal class RuWireGuardConnectionCoordinator(
                     { it.selectionWeight }, { it.metricsAt }, random = random)
                 for (relay in relays) {
                     try {
-                        val credential = if (cachedCredential?.relayNodeId == relay.id) cachedCredential else {
+                        val credential = if (cachedCredential?.relayNodeId == relay.id &&
+                            relay.wireguardEndpoint == cachedCredential.wireguard.endpoint) cachedCredential else {
                             if (keyId == null) keyId = api.registerRuWireGuardKey(token, device, deviceKey, publicKey).id
                             DeviceIdentity.withChallengeTransaction {
                                 val proof = api.createDeviceChallenge(token, device)

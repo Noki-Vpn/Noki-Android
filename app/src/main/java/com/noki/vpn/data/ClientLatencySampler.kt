@@ -17,9 +17,13 @@ internal fun clientLatencyTargetKey(location: ServerLocation): String? =
     clientLatencyTargetKey(location.code, location.host)
 
 internal fun clientLatencyTargetKey(server: VpnServer): String? =
-    clientLatencyTargetKey(server.id, "${server.host}:${server.probePort ?: 0}")
+    clientLatencyTargetKey(server.id, clientLatencyProbeIdentity(server.probeHost ?: server.host, server.probePort, server.probeIp))
 
-internal fun clientLatencyTargetKey(node: RuForeignNode): String = "ru:${node.id}"
+internal fun clientLatencyTargetKey(node: RuForeignNode): String =
+    "ru:${node.id}\u0000${clientLatencyProbeIdentity(node.probeHost, node.probePort, node.probeIp)}"
+
+private fun clientLatencyProbeIdentity(host: String?, port: Int?, ip: String?): String =
+    "${host.orEmpty().trim().lowercase(Locale.ROOT)}:${port?.toString().orEmpty()}|${ip.orEmpty().trim().lowercase(Locale.ROOT)}"
 
 internal fun ServerLocation.withClientLatencies(samples: Map<String, Int>): ServerLocation {
     val measured = servers.map { server -> server.copy(latencyMs = clientLatencyTargetKey(server)?.let(samples::get)) }
@@ -43,6 +47,7 @@ class ClientLatencySampler(
     private val locationTimeoutMillis: Long = 8_000L,
     private val context: Context? = null,
     private val tcpAttempts: Int = LATENCY_TCP_ATTEMPTS,
+    private val boundIcmpPing: (String, String) -> Int? = { ip, name -> DeviceLatency.measureIcmpOnInterface(ip, name) },
 ) {
     private data class ProbeTarget(val key: String?, val host: String?, val port: Int?, val ip: String? = null)
     fun networkSignature(): String = context?.let { AndroidUnderlyingNetworkSource(it).currentSnapshot()?.signature } ?: "none"
@@ -57,9 +62,6 @@ class ClientLatencySampler(
         }.distinctBy { it.key }.toList()
         return measureTargets(targets, allowIcmpFallback = true)
     }
-
-    suspend fun measureRelayTargets(targets: Map<String, List<Pair<String, Int>>>): Map<String, Int> =
-        measureTargets(targets.flatMap { (key, values) -> values.map { (host, port) -> ProbeTarget(key, host, port) } }, false)
 
     suspend fun <T> measureNodes(nodes: List<T>, id: (T) -> String,
         host: (T) -> String?, port: (T) -> Int?, ip: (T) -> String?): Map<String, Int> =
@@ -96,7 +98,7 @@ class ClientLatencySampler(
                                             icmpPing(host, LATENCY_ICMP_COUNT, LATENCY_ICMP_TIMEOUT_SECONDS)
                                         } else null
                                 } else if (probeIp != null && interfaceName != null) {
-                                    DeviceLatency.measureIcmpOnInterface(probeIp, interfaceName)
+                                    boundIcmpPing(probeIp, interfaceName)
                                 } else null
                             }
                         }
